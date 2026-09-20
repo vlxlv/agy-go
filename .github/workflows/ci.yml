@@ -40,6 +40,9 @@ jobs:
       - name: Run static analysis (go vet)
         run: go vet ./...
 
+      - name: Verify critical entrypoints are tracked
+        run: git ls-files --error-unmatch cmd/agy-pool/main.go cmd/agy-tokei/main.go
+
   unit-tests:
     name: Unit Tests (Offline)
     runs-on: ubuntu-latest
