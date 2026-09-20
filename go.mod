@@ -1,6 +1,6 @@
 module github.com/vlxlv/agy-go
 
-go 1.26.7
+go 1.27
 
 require (
 	golang.org/x/crypto v0.57.0

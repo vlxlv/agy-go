@@ -1,7 +1,7 @@
 # agy-go: Antigravity Multi-Account Quota Pool & Tool Suite
 
 [![CI](https://github.com/vlxlv/agy-go/actions/workflows/ci.yml/badge.svg)](https://github.com/vlxlv/agy-go/actions/workflows/ci.yml)
-[![Go Version](https://img.shields.io/badge/go-1.26.7-blue.svg)](go.mod)
+[![Go Version](https://img.shields.io/badge/go-1.27-blue.svg)](go.mod)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Darwin%20%7C%20Termux-green.svg)](#)
 [![CGO](https://img.shields.io/badge/CGO-disabled%20(0)-brightgreen.svg)](#)
