@@ -112,9 +112,40 @@ func (s *Service) Ingest() (*IngestStats, error) {
 	}
 	defer ledger.Close()
 
-	reader := NewReader(s.opts.SummariesPath)
-	catalog, _ := reader.ReadCatalog()
+	// Synchronize or load catalog metadata
+	catalog := make(map[string]*ConversationMeta)
+	summariesPath := s.opts.SummariesPath
+	if fiSum, err := os.Stat(summariesPath); err == nil && !fiSum.IsDir() {
+		catalogSync, err := ledger.GetCatalogSyncState()
+		if err != nil {
+			return nil, fmt.Errorf("get catalog sync state: %w", err)
+		}
 
+		catalogUnchanged := !s.opts.Force && catalogSync != nil &&
+			catalogSync.CatalogPath == summariesPath &&
+			catalogSync.CatalogSize == fiSum.Size() &&
+			catalogSync.CatalogMtimeNs == fiSum.ModTime().UnixNano()
+
+		if catalogUnchanged {
+			catalog, err = ledger.GetAllConversationMetadata()
+			if err != nil {
+				return nil, fmt.Errorf("get cached conversation metadata: %w", err)
+			}
+		} else {
+			sumReader := NewReader(summariesPath)
+			catalog, err = sumReader.ReadCatalog()
+			if err != nil {
+				return nil, fmt.Errorf("read catalog: %w", err)
+			}
+			if err := ledger.SyncCatalog(summariesPath, fiSum.Size(), fiSum.ModTime().UnixNano(), catalog); err != nil {
+				return nil, fmt.Errorf("sync catalog: %w", err)
+			}
+		}
+	} else {
+		catalog, _ = ledger.GetAllConversationMetadata()
+	}
+
+	reader := NewReader(summariesPath)
 	manifests, err := ledger.GetManifests()
 	if err != nil {
 		return nil, err
@@ -129,6 +160,7 @@ func (s *Service) Ingest() (*IngestStats, error) {
 		fi, err := os.Stat(dbPath)
 		if err != nil {
 			stats.FailedCount++
+			_ = ledger.RecordScanFailure(cid, dbPath, err)
 			continue
 		}
 
@@ -142,6 +174,7 @@ func (s *Service) Ingest() (*IngestStats, error) {
 				}
 
 				if existing.IsComplete && !hasActiveWAL &&
+					existing.LastScanStatus != "failed" &&
 					existing.SourceSize == fi.Size() &&
 					existing.SourceMtimeNs == fi.ModTime().UnixNano() {
 					stats.AlreadyUpToDate++
@@ -155,17 +188,7 @@ func (s *Service) Ingest() (*IngestStats, error) {
 		readRes, err := reader.ReadConversation(dbPath, meta)
 		if err != nil {
 			stats.FailedCount++
-			manifest := &SourceManifest{
-				ConversationID:    cid,
-				SourcePath:        dbPath,
-				SourceSize:        fi.Size(),
-				SourceMtimeNs:     fi.ModTime().UnixNano(),
-				SourceFingerprint: fmt.Sprintf("size=%d:mtime=%d", fi.Size(), fi.ModTime().UnixNano()),
-				IsComplete:        false,
-				Status:            "failed",
-				ErrorMessage:      err.Error(),
-			}
-			_ = ledger.CommitIngest(manifest, nil)
+			_ = ledger.RecordScanFailure(cid, dbPath, err)
 			continue
 		}
 

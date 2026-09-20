@@ -140,6 +140,10 @@ func runStatus(args []string) {
 	fmt.Printf("  Discovered Conversations: %d\n", st.DiscoveredConversations)
 	fmt.Printf("  Indexed Conversations:    %d (completed: %d, active: %d, failed: %d)\n",
 		st.IndexedConversations, st.CompletedConversations, st.ActiveConversations, st.FailedConversations)
+	if st.FailedScans > 0 {
+		fmt.Printf("  Failed Scan Attempts:     %d\n", st.FailedScans)
+	}
+	fmt.Printf("  Synced Metadata Records:  %d\n", st.MetadataCount)
 	fmt.Printf("  Total Unique Generations: %d\n", st.TotalGenerations)
 	fmt.Printf("  Total Tokens Processed:   %s\n", formatNumber(st.TotalTokens))
 }
@@ -170,9 +174,11 @@ func runVerify(args []string) {
 	fmt.Printf("  Schema Version:             %d\n", v.SchemaVersion)
 	fmt.Printf("  Total Usage Records:        %d\n", v.TotalRecords)
 	fmt.Printf("  Total Ingest Manifests:     %d\n", v.TotalManifests)
+	fmt.Printf("  Total Metadata Records:     %d\n", v.TotalMetadata)
 	fmt.Printf("  Discrepant Output Tokens:   %d\n", v.DiscrepantOutputTokens)
 	fmt.Printf("  Discrepant Total Tokens:    %d\n", v.DiscrepantTotalTokens)
 	fmt.Printf("  Duplicate Generation IDs:   %d\n", v.DuplicateGenerations)
+	fmt.Printf("  Mismatched Manifest Counts: %d\n", v.MismatchedManifestCount)
 
 	if !v.Valid {
 		fmt.Printf("\nVerification: FAILED\n")

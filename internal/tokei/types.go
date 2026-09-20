@@ -73,6 +73,7 @@ type SourceManifest struct {
 	SourceSize          int64      `json:"source_size"`
 	SourceMtimeNs       int64      `json:"source_mtime_ns"`
 	SourceFingerprint   string     `json:"source_fingerprint"`
+	SourceSHA256        *string    `json:"source_sha256,omitempty"`
 	HighestStepIndex    int64      `json:"highest_step_index"`
 	HighestGenIndex     int64      `json:"highest_gen_index"`
 	GenerationCount     int64      `json:"generation_count"`
@@ -83,6 +84,9 @@ type SourceManifest struct {
 	IsComplete          bool       `json:"is_complete"`
 	Status              string     `json:"status"` // "completed", "active", "failed"
 	ErrorMessage        string     `json:"error_message,omitempty"`
+	LastScanAt          *time.Time `json:"last_scan_at,omitempty"`
+	LastScanStatus      string     `json:"last_scan_status,omitempty"`
+	LastScanError       string     `json:"last_scan_error,omitempty"`
 }
 
 // ConversationMeta holds workspace and project mappings from conversation_summaries.db.
@@ -90,10 +94,22 @@ type ConversationMeta struct {
 	ConversationID string    `json:"conversation_id"`
 	Title          string    `json:"title"`
 	WorkspaceURI   string    `json:"workspace_uri"`
+	WorkspaceURIs  string    `json:"workspace_uris,omitempty"`
 	ProjectID      string    `json:"project_id"`
 	AgentName      string    `json:"agent_name"`
 	LastModified   time.Time `json:"last_modified"`
 	StepCount      int64     `json:"step_count"`
+	UpdatedAt      time.Time `json:"updated_at,omitempty"`
+}
+
+// CatalogSyncState records the sync checkpoint for conversation_summaries.db.
+type CatalogSyncState struct {
+	CatalogPath       string    `json:"catalog_path"`
+	CatalogSize       int64     `json:"catalog_size"`
+	CatalogMtimeNs    int64     `json:"catalog_mtime_ns"`
+	CatalogSHA256     string    `json:"catalog_sha256,omitempty"`
+	ConversationCount int       `json:"conversation_count"`
+	SyncedAt          time.Time `json:"synced_at"`
 }
 
 // ModelNameFromID maps known numeric model IDs in AGY protobufs to canonical model strings.

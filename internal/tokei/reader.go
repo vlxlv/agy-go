@@ -78,6 +78,7 @@ func (r *Reader) ReadCatalog() (map[string]*ConversationMeta, error) {
 			ConversationID: cid,
 			Title:          title,
 			WorkspaceURI:   cleanURI,
+			WorkspaceURIs:  wsUris,
 			ProjectID:      projID,
 			AgentName:      agent,
 			LastModified:   lastMod,
@@ -118,6 +119,11 @@ func (r *Reader) ReadConversation(dbPath string, meta *ConversationMeta) (*Conve
 		return nil, fmt.Errorf("open read-only sqlite %s: %w", dbPath, err)
 	}
 	defer db.Close()
+
+	var schemaVer int
+	if err := db.QueryRow("PRAGMA schema_version;").Scan(&schemaVer); err != nil {
+		return nil, fmt.Errorf("validate sqlite %s: %w", dbPath, err)
+	}
 
 	// 1. Fallback base timestamp from trajectory_metadata_blob
 	var baseTimestamp time.Time

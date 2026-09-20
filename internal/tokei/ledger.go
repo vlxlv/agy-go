@@ -13,7 +13,7 @@ import (
 
 const (
 	// CurrentLedgerSchemaVersion represents the active schema version for usage.db.
-	CurrentLedgerSchemaVersion = 1
+	CurrentLedgerSchemaVersion = 2
 )
 
 // Ledger represents an authoritative SQLite storage handle for agy-tokei usage data.
@@ -98,66 +98,158 @@ func (l *Ledger) Size() int64 {
 	return size
 }
 
-// migrate initializes schema tables idempotently.
+// migrate initializes schema tables idempotently across version upgrades.
 func (l *Ledger) migrate() error {
-	schema := `
-	CREATE TABLE IF NOT EXISTS schema_migrations (
-		version INTEGER PRIMARY KEY,
-		applied_at DATETIME NOT NULL
-	);
-
-	CREATE TABLE IF NOT EXISTS usage_records (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		conversation_id TEXT NOT NULL,
-		generation_id TEXT NOT NULL UNIQUE,
-		step_index INTEGER NOT NULL DEFAULT 0,
-		timestamp DATETIME NOT NULL,
-		workspace_uri TEXT NOT NULL DEFAULT '',
-		project_id TEXT NOT NULL DEFAULT '',
-		model TEXT NOT NULL,
-		provider_id INTEGER NOT NULL DEFAULT 0,
-		response_id TEXT NOT NULL DEFAULT '',
-		provider_assigned_message_id TEXT NOT NULL DEFAULT '',
-		message_id TEXT NOT NULL DEFAULT '',
-		input_tokens INTEGER NOT NULL DEFAULT 0,
-		cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-		cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-		visible_output_tokens INTEGER NOT NULL DEFAULT 0,
-		reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-		total_output_tokens INTEGER NOT NULL DEFAULT 0,
-		total_tokens INTEGER NOT NULL DEFAULT 0,
-		created_at DATETIME NOT NULL
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_usage_conv ON usage_records(conversation_id);
-	CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_records(timestamp);
-	CREATE INDEX IF NOT EXISTS idx_usage_project ON usage_records(project_id);
-	CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_records(model);
-
-	CREATE TABLE IF NOT EXISTS ingest_manifests (
-		conversation_id TEXT PRIMARY KEY,
-		source_path TEXT NOT NULL,
-		source_size INTEGER NOT NULL,
-		source_mtime_ns INTEGER NOT NULL,
-		source_fingerprint TEXT NOT NULL,
-		highest_step_index INTEGER NOT NULL DEFAULT 0,
-		highest_gen_index INTEGER NOT NULL DEFAULT 0,
-		generation_count INTEGER NOT NULL DEFAULT 0,
-		first_usage_timestamp DATETIME,
-		last_usage_timestamp DATETIME,
-		parser_version TEXT NOT NULL,
-		ingested_at DATETIME NOT NULL,
-		is_complete INTEGER NOT NULL DEFAULT 0,
-		status TEXT NOT NULL DEFAULT 'completed',
-		error_message TEXT NOT NULL DEFAULT ''
-	);
-	`
-	if _, err := l.db.Exec(schema); err != nil {
-		return err
+	if _, err := l.db.Exec(`
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version INTEGER PRIMARY KEY,
+			applied_at DATETIME NOT NULL
+		);
+	`); err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
 	}
 
-	_, _ = l.db.Exec(`INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)`,
-		CurrentLedgerSchemaVersion, time.Now().UTC())
+	var maxVersion int
+	_ = l.db.QueryRow("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&maxVersion)
+
+	if maxVersion < 1 {
+		v1Schema := `
+		CREATE TABLE IF NOT EXISTS usage_records (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			conversation_id TEXT NOT NULL,
+			generation_id TEXT NOT NULL UNIQUE,
+			step_index INTEGER NOT NULL DEFAULT 0,
+			timestamp DATETIME NOT NULL,
+			workspace_uri TEXT NOT NULL DEFAULT '',
+			project_id TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL,
+			provider_id INTEGER NOT NULL DEFAULT 0,
+			response_id TEXT NOT NULL DEFAULT '',
+			provider_assigned_message_id TEXT NOT NULL DEFAULT '',
+			message_id TEXT NOT NULL DEFAULT '',
+			input_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+			visible_output_tokens INTEGER NOT NULL DEFAULT 0,
+			reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+			total_output_tokens INTEGER NOT NULL DEFAULT 0,
+			total_tokens INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_usage_conv ON usage_records(conversation_id);
+		CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_records(timestamp);
+		CREATE INDEX IF NOT EXISTS idx_usage_project ON usage_records(project_id);
+		CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_records(model);
+
+		CREATE TABLE IF NOT EXISTS ingest_manifests (
+			conversation_id TEXT PRIMARY KEY,
+			source_path TEXT NOT NULL,
+			source_size INTEGER NOT NULL,
+			source_mtime_ns INTEGER NOT NULL,
+			source_fingerprint TEXT NOT NULL,
+			highest_step_index INTEGER NOT NULL DEFAULT 0,
+			highest_gen_index INTEGER NOT NULL DEFAULT 0,
+			generation_count INTEGER NOT NULL DEFAULT 0,
+			first_usage_timestamp DATETIME,
+			last_usage_timestamp DATETIME,
+			parser_version TEXT NOT NULL,
+			ingested_at DATETIME NOT NULL,
+			is_complete INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'completed',
+			error_message TEXT NOT NULL DEFAULT ''
+		);
+		`
+		if _, err := l.db.Exec(v1Schema); err != nil {
+			return fmt.Errorf("apply v1 schema: %w", err)
+		}
+		if _, err := l.db.Exec("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)", time.Now().UTC()); err != nil {
+			return fmt.Errorf("record v1 migration: %w", err)
+		}
+	}
+
+	if maxVersion < 2 {
+		cols := make(map[string]bool)
+		rows, err := l.db.Query("PRAGMA table_info(ingest_manifests)")
+		if err != nil {
+			return fmt.Errorf("inspect ingest_manifests schema: %w", err)
+		}
+		for rows.Next() {
+			var cid int
+			var name, ctype string
+			var notnull, pk int
+			var dfltValue sql.NullString
+			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err == nil {
+				cols[name] = true
+			}
+		}
+		rows.Close()
+
+		if !cols["last_scan_at"] {
+			if _, err := l.db.Exec("ALTER TABLE ingest_manifests ADD COLUMN last_scan_at DATETIME"); err != nil {
+				return fmt.Errorf("add last_scan_at: %w", err)
+			}
+		}
+		if !cols["last_scan_status"] {
+			if _, err := l.db.Exec("ALTER TABLE ingest_manifests ADD COLUMN last_scan_status TEXT NOT NULL DEFAULT 'completed'"); err != nil {
+				return fmt.Errorf("add last_scan_status: %w", err)
+			}
+		}
+		if !cols["last_scan_error"] {
+			if _, err := l.db.Exec("ALTER TABLE ingest_manifests ADD COLUMN last_scan_error TEXT NOT NULL DEFAULT ''"); err != nil {
+				return fmt.Errorf("add last_scan_error: %w", err)
+			}
+		}
+		if !cols["source_sha256"] {
+			if _, err := l.db.Exec("ALTER TABLE ingest_manifests ADD COLUMN source_sha256 TEXT"); err != nil {
+				return fmt.Errorf("add source_sha256: %w", err)
+			}
+		}
+
+		// Backfill last_scan fields for existing manifests where last_scan_at is NULL
+		if _, err := l.db.Exec(`
+			UPDATE ingest_manifests
+			SET last_scan_at = ingested_at,
+			    last_scan_status = status,
+			    last_scan_error = error_message
+			WHERE last_scan_at IS NULL
+		`); err != nil {
+			return fmt.Errorf("backfill last_scan fields: %w", err)
+		}
+
+		v2Tables := `
+		CREATE TABLE IF NOT EXISTS conversation_metadata (
+			conversation_id TEXT PRIMARY KEY,
+			title TEXT NOT NULL DEFAULT '',
+			workspace_uri TEXT NOT NULL DEFAULT '',
+			workspace_uris TEXT NOT NULL DEFAULT '',
+			project_id TEXT NOT NULL DEFAULT '',
+			agent_name TEXT NOT NULL DEFAULT '',
+			last_modified_time DATETIME,
+			step_count INTEGER NOT NULL DEFAULT 0,
+			updated_at DATETIME NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_meta_project ON conversation_metadata(project_id);
+
+		CREATE TABLE IF NOT EXISTS catalog_sync_state (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			catalog_path TEXT NOT NULL,
+			catalog_size INTEGER NOT NULL,
+			catalog_mtime_ns INTEGER NOT NULL,
+			catalog_sha256 TEXT NOT NULL DEFAULT '',
+			conversation_count INTEGER NOT NULL DEFAULT 0,
+			synced_at DATETIME NOT NULL
+		);
+		`
+		if _, err := l.db.Exec(v2Tables); err != nil {
+			return fmt.Errorf("apply v2 tables: %w", err)
+		}
+
+		if _, err := l.db.Exec("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?)", time.Now().UTC()); err != nil {
+			return fmt.Errorf("record v2 migration: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -170,7 +262,8 @@ func (l *Ledger) GetManifests() (map[string]*SourceManifest, error) {
 		SELECT conversation_id, source_path, source_size, source_mtime_ns, source_fingerprint,
 		       highest_step_index, highest_gen_index, generation_count,
 		       first_usage_timestamp, last_usage_timestamp, parser_version,
-		       ingested_at, is_complete, status, error_message
+		       ingested_at, is_complete, status, error_message,
+		       last_scan_at, last_scan_status, last_scan_error, source_sha256
 		FROM ingest_manifests
 	`)
 	if err != nil {
@@ -182,12 +275,14 @@ func (l *Ledger) GetManifests() (map[string]*SourceManifest, error) {
 	for rows.Next() {
 		var m SourceManifest
 		var isCompInt int
-		var firstTS, lastTS sql.NullTime
+		var firstTS, lastTS, lastScanTS sql.NullTime
+		var lastScanStatus, lastScanError, sha256 sql.NullString
 		if err := rows.Scan(
 			&m.ConversationID, &m.SourcePath, &m.SourceSize, &m.SourceMtimeNs, &m.SourceFingerprint,
 			&m.HighestStepIndex, &m.HighestGenIndex, &m.GenerationCount,
 			&firstTS, &lastTS, &m.ParserVersion,
 			&m.IngestedAt, &isCompInt, &m.Status, &m.ErrorMessage,
+			&lastScanTS, &lastScanStatus, &lastScanError, &sha256,
 		); err != nil {
 			return nil, fmt.Errorf("scan manifest: %w", err)
 		}
@@ -199,6 +294,20 @@ func (l *Ledger) GetManifests() (map[string]*SourceManifest, error) {
 		if lastTS.Valid {
 			t := lastTS.Time.UTC()
 			m.LastUsageTimestamp = &t
+		}
+		if lastScanTS.Valid {
+			t := lastScanTS.Time.UTC()
+			m.LastScanAt = &t
+		}
+		if lastScanStatus.Valid {
+			m.LastScanStatus = lastScanStatus.String
+		}
+		if lastScanError.Valid {
+			m.LastScanError = lastScanError.String
+		}
+		if sha256.Valid && sha256.String != "" {
+			s := sha256.String
+			m.SourceSHA256 = &s
 		}
 		result[m.ConversationID] = &m
 	}
@@ -289,13 +398,27 @@ func (l *Ledger) CommitIngest(manifest *SourceManifest, records []*UsageRecord) 
 		isCompInt = 1
 	}
 
+	if manifest.LastScanStatus == "" {
+		manifest.LastScanStatus = manifest.Status
+	}
+	if manifest.LastScanAt == nil || manifest.LastScanAt.IsZero() {
+		manifest.LastScanAt = &now
+	}
+	manifest.LastScanError = manifest.ErrorMessage
+
+	var sha256Val sql.NullString
+	if manifest.SourceSHA256 != nil && *manifest.SourceSHA256 != "" {
+		sha256Val = sql.NullString{String: *manifest.SourceSHA256, Valid: true}
+	}
+
 	manifestStmt, err := tx.Prepare(`
 		INSERT INTO ingest_manifests (
 			conversation_id, source_path, source_size, source_mtime_ns, source_fingerprint,
 			highest_step_index, highest_gen_index, generation_count,
 			first_usage_timestamp, last_usage_timestamp, parser_version,
-			ingested_at, is_complete, status, error_message
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ingested_at, is_complete, status, error_message,
+			last_scan_at, last_scan_status, last_scan_error, source_sha256
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(conversation_id) DO UPDATE SET
 			source_path = excluded.source_path,
 			source_size = excluded.source_size,
@@ -310,7 +433,11 @@ func (l *Ledger) CommitIngest(manifest *SourceManifest, records []*UsageRecord) 
 			ingested_at = excluded.ingested_at,
 			is_complete = excluded.is_complete,
 			status = excluded.status,
-			error_message = excluded.error_message
+			error_message = excluded.error_message,
+			last_scan_at = excluded.last_scan_at,
+			last_scan_status = excluded.last_scan_status,
+			last_scan_error = excluded.last_scan_error,
+			source_sha256 = COALESCE(excluded.source_sha256, ingest_manifests.source_sha256)
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare manifest stmt: %w", err)
@@ -322,6 +449,7 @@ func (l *Ledger) CommitIngest(manifest *SourceManifest, records []*UsageRecord) 
 		manifest.HighestStepIndex, manifest.HighestGenIndex, manifest.GenerationCount,
 		manifest.FirstUsageTimestamp, manifest.LastUsageTimestamp, manifest.ParserVersion,
 		manifest.IngestedAt, isCompInt, manifest.Status, manifest.ErrorMessage,
+		manifest.LastScanAt, manifest.LastScanStatus, manifest.LastScanError, sha256Val,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert manifest %s: %w", manifest.ConversationID, err)
@@ -335,6 +463,189 @@ func (l *Ledger) CommitIngest(manifest *SourceManifest, records []*UsageRecord) 
 	return nil
 }
 
+// RecordScanFailure records a failed read/decode attempt without destroying the last known-good ingest state.
+func (l *Ledger) RecordScanFailure(cid string, sourcePath string, scanErr error) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := time.Now().UTC()
+	errMsg := ""
+	if scanErr != nil {
+		errMsg = scanErr.Error()
+	}
+
+	var exists bool
+	err := l.db.QueryRow("SELECT 1 FROM ingest_manifests WHERE conversation_id = ?", cid).Scan(&exists)
+	if err == sql.ErrNoRows {
+		_, insertErr := l.db.Exec(`
+			INSERT INTO ingest_manifests (
+				conversation_id, source_path, source_size, source_mtime_ns, source_fingerprint,
+				highest_step_index, highest_gen_index, generation_count,
+				parser_version, ingested_at, is_complete, status, error_message,
+				last_scan_at, last_scan_status, last_scan_error
+			) VALUES (?, ?, 0, 0, '', 0, 0, 0, ?, ?, 0, 'failed', ?, ?, 'failed', ?)
+		`, cid, sourcePath, ParserVersion, now, errMsg, now, errMsg)
+		return insertErr
+	} else if err != nil {
+		return err
+	}
+
+	_, updateErr := l.db.Exec(`
+		UPDATE ingest_manifests
+		SET last_scan_at = ?,
+		    last_scan_status = 'failed',
+		    last_scan_error = ?
+		WHERE conversation_id = ?
+	`, now, errMsg, cid)
+	return updateErr
+}
+
+// GetCatalogSyncState returns the cached sync state for conversation_summaries.db.
+func (l *Ledger) GetCatalogSyncState() (*CatalogSyncState, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	var st CatalogSyncState
+	err := l.db.QueryRow(`
+		SELECT catalog_path, catalog_size, catalog_mtime_ns, conversation_count, synced_at
+		FROM catalog_sync_state
+		WHERE id = 1
+	`).Scan(&st.CatalogPath, &st.CatalogSize, &st.CatalogMtimeNs, &st.ConversationCount, &st.SyncedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	} else if err != nil {
+		return nil, fmt.Errorf("query catalog_sync_state: %w", err)
+	}
+	return &st, nil
+}
+
+// SyncCatalog records conversation metadata and propagates project/workspace updates to usage_records.
+func (l *Ledger) SyncCatalog(path string, size int64, mtimeNs int64, catalog map[string]*ConversationMeta) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	tx, err := l.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin sync catalog tx: %w", err)
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	now := time.Now().UTC()
+
+	metaStmt, err := tx.Prepare(`
+		INSERT INTO conversation_metadata (
+			conversation_id, title, workspace_uri, workspace_uris,
+			project_id, agent_name, last_modified_time, step_count, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(conversation_id) DO UPDATE SET
+			title = excluded.title,
+			workspace_uri = excluded.workspace_uri,
+			workspace_uris = excluded.workspace_uris,
+			project_id = excluded.project_id,
+			agent_name = excluded.agent_name,
+			last_modified_time = excluded.last_modified_time,
+			step_count = excluded.step_count,
+			updated_at = excluded.updated_at
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare meta stmt: %w", err)
+	}
+	defer metaStmt.Close()
+
+	updateRecordStmt, err := tx.Prepare(`
+		UPDATE usage_records
+		SET project_id = ?,
+		    workspace_uri = ?
+		WHERE conversation_id = ?
+		  AND (project_id != ? OR workspace_uri != ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare update usage records stmt: %w", err)
+	}
+	defer updateRecordStmt.Close()
+
+	for cid, meta := range catalog {
+		var lastMod *time.Time
+		if !meta.LastModified.IsZero() {
+			t := meta.LastModified.UTC()
+			lastMod = &t
+		}
+
+		_, err := metaStmt.Exec(
+			cid, meta.Title, meta.WorkspaceURI, meta.WorkspaceURIs,
+			meta.ProjectID, meta.AgentName, lastMod, meta.StepCount, now,
+		)
+		if err != nil {
+			return fmt.Errorf("upsert meta for %s: %w", cid, err)
+		}
+
+		projID := meta.ProjectID
+		if projID == "" {
+			projID = "unknown"
+		}
+		_, err = updateRecordStmt.Exec(projID, meta.WorkspaceURI, cid, projID, meta.WorkspaceURI)
+		if err != nil {
+			return fmt.Errorf("update usage records for %s: %w", cid, err)
+		}
+	}
+
+	_, err = tx.Exec(`
+		INSERT INTO catalog_sync_state (id, catalog_path, catalog_size, catalog_mtime_ns, conversation_count, synced_at)
+		VALUES (1, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			catalog_path = excluded.catalog_path,
+			catalog_size = excluded.catalog_size,
+			catalog_mtime_ns = excluded.catalog_mtime_ns,
+			conversation_count = excluded.conversation_count,
+			synced_at = excluded.synced_at
+	`, path, size, mtimeNs, len(catalog), now)
+	if err != nil {
+		return fmt.Errorf("upsert catalog sync state: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit catalog sync: %w", err)
+	}
+	tx = nil
+	return nil
+}
+
+// GetAllConversationMetadata retrieves all persisted conversation metadata from usage.db.
+func (l *Ledger) GetAllConversationMetadata() (map[string]*ConversationMeta, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	rows, err := l.db.Query(`
+		SELECT conversation_id, title, workspace_uri, workspace_uris, project_id, agent_name, last_modified_time, step_count, updated_at
+		FROM conversation_metadata
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("query conversation_metadata: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[string]*ConversationMeta)
+	for rows.Next() {
+		var m ConversationMeta
+		var lastMod sql.NullTime
+		if err := rows.Scan(
+			&m.ConversationID, &m.Title, &m.WorkspaceURI, &m.WorkspaceURIs,
+			&m.ProjectID, &m.AgentName, &lastMod, &m.StepCount, &m.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan conversation_metadata: %w", err)
+		}
+		if lastMod.Valid {
+			m.LastModified = lastMod.Time.UTC()
+		}
+		result[m.ConversationID] = &m
+	}
+	return result, nil
+}
+
 // StatusReport provides a health and progress overview of the usage ledger.
 type StatusReport struct {
 	LedgerPath              string `json:"ledger_path"`
@@ -344,6 +655,8 @@ type StatusReport struct {
 	CompletedConversations  int    `json:"completed_conversations"`
 	ActiveConversations     int    `json:"active_conversations"`
 	FailedConversations     int    `json:"failed_conversations"`
+	FailedScans             int    `json:"failed_scans"`
+	MetadataCount           int    `json:"metadata_count"`
 	TotalGenerations        int64  `json:"total_generations"`
 	TotalTokens             uint64 `json:"total_tokens"`
 }
@@ -363,12 +676,15 @@ func (l *Ledger) GetStatus(discoveredCount int) (*StatusReport, error) {
 		SELECT COUNT(*),
 		       COALESCE(SUM(CASE WHEN is_complete = 1 THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN is_complete = 0 AND status = 'active' THEN 1 ELSE 0 END), 0),
-		       COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0)
+		       COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN last_scan_status = 'failed' THEN 1 ELSE 0 END), 0)
 		FROM ingest_manifests
 	`)
-	if err := row.Scan(&rep.IndexedConversations, &rep.CompletedConversations, &rep.ActiveConversations, &rep.FailedConversations); err != nil {
+	if err := row.Scan(&rep.IndexedConversations, &rep.CompletedConversations, &rep.ActiveConversations, &rep.FailedConversations, &rep.FailedScans); err != nil {
 		return nil, fmt.Errorf("scan status counts: %w", err)
 	}
+
+	_ = l.db.QueryRow(`SELECT COUNT(*) FROM conversation_metadata`).Scan(&rep.MetadataCount)
 
 	rowGen := l.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(total_tokens), 0) FROM usage_records`)
 	if err := rowGen.Scan(&rep.TotalGenerations, &rep.TotalTokens); err != nil {
@@ -384,6 +700,7 @@ type VerifyReport struct {
 	SchemaVersion           int      `json:"schema_version"`
 	TotalRecords            int64    `json:"total_records"`
 	TotalManifests          int64    `json:"total_manifests"`
+	TotalMetadata           int64    `json:"total_metadata"`
 	DiscrepantOutputTokens  int64    `json:"discrepant_output_tokens"`
 	DiscrepantTotalTokens   int64    `json:"discrepant_total_tokens"`
 	DuplicateGenerations    int64    `json:"duplicate_generations"`
@@ -405,9 +722,10 @@ func (l *Ledger) Verify() (*VerifyReport, error) {
 		rep.Errors = append(rep.Errors, fmt.Sprintf("SQLite quick_check failed: %s (err: %v)", integrity, err))
 	}
 
-	// 2. Count records and manifests
+	// 2. Count records, manifests, metadata
 	_ = l.db.QueryRow("SELECT COUNT(*) FROM usage_records").Scan(&rep.TotalRecords)
 	_ = l.db.QueryRow("SELECT COUNT(*) FROM ingest_manifests").Scan(&rep.TotalManifests)
+	_ = l.db.QueryRow("SELECT COUNT(*) FROM conversation_metadata").Scan(&rep.TotalMetadata)
 
 	// 3. Invariant check: TotalOutputTokens == VisibleOutputTokens + ReasoningTokens
 	rowOut := l.db.QueryRow(`
@@ -441,6 +759,19 @@ func (l *Ledger) Verify() (*VerifyReport, error) {
 	if rep.DuplicateGenerations > 0 {
 		rep.Valid = false
 		rep.Errors = append(rep.Errors, fmt.Sprintf("%d duplicate generation_id records detected", rep.DuplicateGenerations))
+	}
+
+	// 6. Invariant check: manifest generation_count matches usage_records count for completed manifests
+	rowMismatch := l.db.QueryRow(`
+		SELECT COUNT(*) FROM ingest_manifests m
+		WHERE m.status = 'completed' AND m.generation_count != (
+			SELECT COUNT(*) FROM usage_records u WHERE u.conversation_id = m.conversation_id
+		)
+	`)
+	_ = rowMismatch.Scan(&rep.MismatchedManifestCount)
+	if rep.MismatchedManifestCount > 0 {
+		rep.Valid = false
+		rep.Errors = append(rep.Errors, fmt.Sprintf("%d completed manifests have mismatched generation counts against usage records", rep.MismatchedManifestCount))
 	}
 
 	return rep, nil
