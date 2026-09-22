@@ -942,3 +942,71 @@ func TestGoroutineLeak_SSEAndCancellation(t *testing.T) {
 
 	assertNoGoroutineLeak(t, initialGoroutines)
 }
+
+func TestIncompleteErrorResponseDoesNotFailover(t *testing.T) {
+	for _, status := range []int{401, 403, 429} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			setupTwoAccountPool(t)
+			defer resetProviders()
+			var attempts atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts.Add(1)
+				w.Header().Set("Content-Length", "1000")
+				w.WriteHeader(status)
+				_, _ = io.WriteString(w, `{"error":"quota exhausted"}`)
+			}))
+			defer upstream.Close()
+			BackendURLProvider = func() string { return upstream.URL }
+			rec := httptest.NewRecorder()
+			NewHandler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/generateContent", strings.NewReader(`{}`)))
+			if rec.Code != 502 || attempts.Load() != 1 {
+				t.Fatalf("status=%d attempts=%d", rec.Code, attempts.Load())
+			}
+			pool, err := storage.LoadPool()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, acc := range pool.Accounts {
+				if acc.Status != "" || acc.RateLimitedUntil != nil {
+					t.Fatalf("incomplete response restricted account: %+v", acc)
+				}
+			}
+		})
+	}
+}
+
+func TestRedirectsNeverCauseAnotherUpstreamRequest(t *testing.T) {
+	for _, generation := range []bool{false, true} {
+		for _, status := range []int{301, 302, 303, 307, 308} {
+			t.Run(fmt.Sprintf("generation=%t/status=%d", generation, status), func(t *testing.T) {
+				var attempts atomic.Int32
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					attempts.Add(1)
+					if r.URL.Path == "/target" {
+						w.WriteHeader(200)
+						return
+					}
+					w.Header().Set("Location", "/target")
+					w.WriteHeader(status)
+				}))
+				defer upstream.Close()
+				client := defaultHTTPClient
+				if generation {
+					client = defaultGenerationClient
+				}
+				req, err := http.NewRequest("POST", upstream.URL, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				resp.Body.Close()
+				if resp.StatusCode != status || attempts.Load() != 1 {
+					t.Fatalf("status=%d attempts=%d", resp.StatusCode, attempts.Load())
+				}
+			})
+		}
+	}
+}

@@ -181,6 +181,10 @@ func StartInstance(ctx *InstanceContext, opts LaunchOptions) (*StartResult, erro
 		}, nil
 	}
 
+	// Reap only the child spawned by this attempt; never leave it starting in the background.
+	_ = cmd.Process.Kill()
+	<-childExited
+	_, _ = RemovePIDFileIfOwned(pidFile, cmd.Process.Pid)
 	return nil, fmt.Errorf("failed to start gateway daemon on port %d; inspect log file at %s", ctx.ListenPort, logFile)
 }
 

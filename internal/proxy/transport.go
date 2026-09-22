@@ -25,8 +25,9 @@ var (
 	}
 
 	defaultHTTPClient = &http.Client{
-		Transport: BaseTransport,
-		Timeout:   300 * time.Second,
+		Transport:     BaseTransport,
+		Timeout:       300 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	HTTPClient = defaultHTTPClient
 
@@ -46,8 +47,9 @@ var (
 	}
 
 	defaultGenerationClient = &http.Client{
-		Transport: &GenerationRoundTripper{Base: GenerationTransport},
-		Timeout:   300 * time.Second,
+		Transport:     &GenerationRoundTripper{Base: GenerationTransport},
+		Timeout:       300 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	GenerationClient = defaultGenerationClient
 

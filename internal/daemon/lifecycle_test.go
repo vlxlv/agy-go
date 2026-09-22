@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -401,4 +403,96 @@ func TestDaemon_StartsQuotaRefresher(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for background QuotaRefresher to be called by daemon")
 	}
+}
+
+func TestStartFailureReapsSlowChild(t *testing.T) {
+	if os.Getenv("AGY_SLOW_START_HELPER") == "1" {
+		if err := os.WriteFile(os.Getenv("AGY_CHILD_PID_CAPTURE"), []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+			os.Exit(2)
+		}
+		time.Sleep(time.Minute)
+		os.Exit(0)
+	}
+	dir := t.TempDir()
+	capture := filepath.Join(dir, "spawned.pid")
+	t.Setenv("AGY_SLOW_START_HELPER", "1")
+	t.Setenv("AGY_CHILD_PID_CAPTURE", capture)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	_, err = StartDaemon(LaunchOptions{StateDir: dir, Port: port, EntrypointPath: os.Args[0], CustomArgs: []string{"-test.run=^TestStartFailureReapsSlowChild$"}})
+	if err == nil {
+		t.Fatal("slow child unexpectedly became ready")
+	}
+	b, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if IsProcessAlive(pid) {
+		t.Fatalf("failed startup left child %d alive", pid)
+	}
+}
+
+func TestShutdownCancelsActiveRequest(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan struct{})
+	ports := make(chan int, 1)
+	entered := make(chan struct{})
+	canceled := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- RunForeground(ctx, ServerOptions{
+			EphemeralPort: true, PIDFile: filepath.Join(t.TempDir(), "server.pid"), DisableSignals: true,
+			ReadyChan: ready, BoundPortChan: ports,
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				close(entered)
+				<-r.Context().Done()
+				close(canceled)
+			}),
+		})
+	}()
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("startup: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("startup timeout")
+	}
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/", <-ports))
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler timeout")
+	}
+	cancel()
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("request context not canceled")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("shutdown timeout")
+	}
+	<-clientDone
 }

@@ -333,3 +333,31 @@ func TestProxy_GenerationTriggersAsyncQuotaRefreshForStaleCandidate(t *testing.T
 		// OK
 	}
 }
+
+// Repeated input avoids allocating an oversized fixture before exercising the limit.
+type repeatedBody struct{}
+
+func (repeatedBody) Read(p []byte) (int, error) { clear(p); return len(p), nil }
+
+func TestOversizedRequestRejectedBeforeDispatch(t *testing.T) {
+	for _, mode := range []string{"length", "header", "chunked"} {
+		t.Run(mode, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/v1/generateContent", nil)
+			req.Body = io.NopCloser(io.LimitReader(repeatedBody{}, maxRequestBodyBytes+1))
+			switch mode {
+			case "length":
+				req.ContentLength = maxRequestBodyBytes + 1
+			case "header":
+				req.Header.Set("Content-Length", "9223372036854775807")
+			case "chunked":
+				req.ContentLength = -1
+				req.TransferEncoding = []string{"chunked"}
+			}
+			rec := httptest.NewRecorder()
+			NewHandler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}

@@ -355,8 +355,14 @@ func logMessage(prefix, msg string) {
 	}
 }
 
+const maxRequestBodyBytes int64 = 64 << 20
+
 // ReadRequestBody validates Content-Length / Transfer-Encoding constraints and returns body bytes.
 func ReadRequestBody(r *http.Request) ([]byte, error) {
+	if r.ContentLength > maxRequestBodyBytes {
+		return nil, &http.MaxBytesError{Limit: maxRequestBodyBytes}
+	}
+	r.Body = http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes)
 	contentLengths := r.Header.Values("Content-Length")
 	te := r.Header.Get("Transfer-Encoding")
 
@@ -381,6 +387,9 @@ func ReadRequestBody(r *http.Request) ([]byte, error) {
 		}
 		if clVal < 0 {
 			return nil, errors.New("negative Content-Length")
+		}
+		if clVal > maxRequestBodyBytes {
+			return nil, &http.MaxBytesError{Limit: maxRequestBodyBytes}
 		}
 		buf := make([]byte, clVal)
 		n, err := io.ReadFull(r.Body, buf)
@@ -525,7 +534,12 @@ func (h *Handler) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 	body, err := ReadRequestBody(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		status := http.StatusBadRequest
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 
@@ -838,7 +852,7 @@ func (h *Handler) dispatchAccount(
 
 		pathBase := filepathBase(path)
 		dispName := accounts.DisplayAccountName(acc)
-		logMessage("PROXY EXCEPTION", fmt.Sprintf("%s %s -> %s: %v", r.Method, pathBase, dispName, err))
+		logMessage("PROXY EXCEPTION", fmt.Sprintf("%s %s -> %s: upstream transport failed", r.Method, pathBase, dispName))
 		notifyAudit(502, "AmbiguousTransportFailure")
 		observability.RecordNoReplayPrevented()
 
@@ -860,8 +874,23 @@ func (h *Handler) dispatchAccount(
 	pathBase := filepathBase(path)
 	dispName = accounts.DisplayAccountName(acc)
 
-	if statusCode >= 400 {
-		errBody, _ := io.ReadAll(resp.Body)
+	if statusCode >= 300 {
+		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxRequestBodyBytes+1))
+		if readErr != nil || int64(len(errBody)) > maxRequestBodyBytes {
+			notifyAudit(statusCode, "AmbiguousTransportFailure:BodyReadError")
+			observability.RecordNoReplayPrevented()
+			code := http.StatusBadGateway
+			if IsTimeoutError(readErr) {
+				code = http.StatusGatewayTimeout
+			}
+			http.Error(committer, "Upstream response incomplete or too large", code)
+			return DispatchOutcome{Action: ActionTerminal, Reason: "AmbiguousTransportFailure:BodyReadError", Err: ErrAmbiguousTransport}
+		}
+		if statusCode < 400 {
+			notifyAudit(statusCode, "UpstreamRedirect")
+			SendBuffered(committer, statusCode, resp.Header, errBody)
+			return DispatchOutcome{Action: ActionTerminal, Reason: "UpstreamRedirect"}
+		}
 
 		auditSuffix := ""
 		if frozenEvent != nil {

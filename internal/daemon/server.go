@@ -189,8 +189,12 @@ func RunForeground(ctx context.Context, opts ServerOptions) error {
 
 	// 6. Create HTTP server
 	server := &http.Server{
-		Handler: handler,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
+
+	server.BaseContext = func(net.Listener) context.Context { return serverCtx }
 
 	// 7. Signal readiness if requested
 	var once sync.Once
@@ -210,19 +214,22 @@ func RunForeground(ctx context.Context, opts ServerOptions) error {
 		}
 	}()
 
-	// 9. Wait for termination or error
+	// Both cancellation and unexpected Serve failures must release workers and connections.
+	var serveErr error
 	select {
-	case err := <-serveErrChan:
-		return err
+	case serveErr = <-serveErrChan:
 	case <-serverCtx.Done():
-		// Graceful shutdown with 5s timeout
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer shutdownCancel()
-		_ = server.Shutdown(shutdownCtx)
-		<-refresherDone
-		<-statsWriter.Done()
-		return nil
 	}
+	cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		_ = server.Close()
+		serveErr = errors.Join(serveErr, err)
+	}
+	<-refresherDone
+	<-statsWriter.Done()
+	return serveErr
 }
 
 // IsPortListening reports whether a TCP connect to 127.0.0.1:port succeeds within 300ms.
