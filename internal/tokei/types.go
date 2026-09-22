@@ -7,7 +7,7 @@ import (
 )
 
 // ParserVersion records the parser format version for provenance tracking.
-const ParserVersion = "1.0.0"
+const ParserVersion = "1.1.0"
 
 // DefaultModel is the fallback model name when none can be determined.
 const DefaultModel = "gemini-internal-model"
@@ -38,17 +38,12 @@ type UsageRecord struct {
 
 // Normalize validates and enforces token arithmetic invariants on the record.
 func (u *UsageRecord) Normalize() {
-	// TotalOutputTokens = VisibleOutputTokens + ReasoningTokens
+	// Total output must cover all known output components.
 	calculatedOutput := u.VisibleOutputTokens + u.ReasoningTokens
 	if calculatedOutput > u.TotalOutputTokens {
 		u.TotalOutputTokens = calculatedOutput
-	} else if u.TotalOutputTokens > calculatedOutput {
-		if u.ReasoningTokens > 0 && u.VisibleOutputTokens == 0 {
-			u.VisibleOutputTokens = u.TotalOutputTokens - u.ReasoningTokens
-		} else if u.VisibleOutputTokens > 0 && u.ReasoningTokens == 0 {
-			u.ReasoningTokens = u.TotalOutputTokens - u.VisibleOutputTokens
-		}
 	}
+	// Preserve an unknown output breakdown; do not invent reasoning or visible tokens.
 
 	// TotalTokens = InputTokens + CacheReadTokens + TotalOutputTokens
 	u.TotalTokens = u.InputTokens + u.CacheReadTokens + u.TotalOutputTokens

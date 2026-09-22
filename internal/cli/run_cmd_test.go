@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vlxlv/agy-go/internal/config"
 	"github.com/vlxlv/agy-go/internal/diagnostics"
@@ -17,6 +18,7 @@ import (
 func TestRunWrapperAndAgyDirect(t *testing.T) {
 	_, cleanup := setupCLITestEnv(t)
 	defer cleanup()
+	seedRunAccount(t, config.GetDataDir())
 
 	diagnostics.SetAgyBinaryFinder(func() string { return "/fake/bin/agy" })
 
@@ -143,6 +145,7 @@ func TestRunArgumentScopingAndDelimiter(t *testing.T) {
 	}
 
 	dataDir := filepath.Join(tmpDir, "data")
+	seedRunAccount(t, dataDir)
 
 	diagnostics.SetAgyBinaryFinder(func() string { return "/fake/bin/agy" })
 
@@ -236,6 +239,7 @@ func TestRunBareContinueResolvesConversation(t *testing.T) {
 	// 2. Setup config and data dir
 	cfgFile := filepath.Join(tempDir, "config.json")
 	dataDir := filepath.Join(tempDir, "state_run")
+	seedRunAccount(t, dataDir)
 	cfgContent := `{"version": 1, "server": {"port": 9199}}`
 	if err := os.WriteFile(cfgFile, []byte(cfgContent), 0644); err != nil {
 		t.Fatalf("failed to write config: %v", err)
@@ -342,6 +346,7 @@ func TestRunAgyWithLB_ArgumentPreservation(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	dataDir := filepath.Join(tmpDir, "data")
+	seedRunAccount(t, dataDir)
 	cfgFile := filepath.Join(tmpDir, "config.json")
 	_ = os.WriteFile(cfgFile, []byte(`{"version":1,"server":{"listen":"127.0.0.1","port":9999}}`), 0o600)
 
@@ -419,6 +424,7 @@ func TestRunAgyWithLB_ResolvesManagedNativeBinary(t *testing.T) {
 
 	cfgFile := filepath.Join(fakeHome, "config.json")
 	dataDir := filepath.Join(fakeHome, "data")
+	seedRunAccount(t, dataDir)
 	_ = os.WriteFile(cfgFile, []byte(`{"version":1,"server":{"listen":"127.0.0.1","port":9876}}`), 0600)
 
 	var capturedBinary string
@@ -621,5 +627,33 @@ func TestRunAgyWithLB_SyncFailureAborts(t *testing.T) {
 	}
 	if strings.Contains(stderrStr, secretEmail) {
 		t.Fatalf("email leaked in stderr: %s", stderrStr)
+	}
+}
+
+func TestRunRequiresActiveSynchronization(t *testing.T) {
+	_, cleanup := setupCLITestEnv(t)
+	defer cleanup()
+	if err := storage.SavePool(storage.NewEmptyPool()); err != nil {
+		t.Fatal(err)
+	}
+	ExecHandler = func(string, []string, []string) error { t.Fatal("executed without active identity"); return nil }
+	var stdout, stderr bytes.Buffer
+	if code := Main([]string{"run"}, nil, &stdout, &stderr); code != 1 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+}
+
+func seedRunAccount(t *testing.T, dataDir string) {
+	t.Helper()
+	if err := config.ConfigureDataDir(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	expiry := float64(time.Now().Unix() + 3600)
+	acc := &storage.Account{ID: "acc_1", AccessToken: "test-access", TokenExpiry: &expiry}
+	pool := storage.NewEmptyPool()
+	pool.Accounts = []*storage.Account{acc}
+	pool.ActiveAccountID = &acc.ID
+	if err := storage.SavePool(pool); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -223,6 +223,7 @@ func TestService_MalformedSourceAttempt(t *testing.T) {
 	svc := NewService(ServiceOptions{
 		LedgerPath:       ledgerPath,
 		ConversationsDir: convDir,
+		SummariesPath:    filepath.Join(tempDir, "absent-summaries.db"),
 	})
 
 	// 1. Ingest valid database
@@ -292,5 +293,49 @@ func TestService_MalformedSourceAttempt(t *testing.T) {
 	}
 	if !vReport.Valid {
 		t.Errorf("expected verify to pass, got errors: %v", vReport.Errors)
+	}
+}
+
+func TestServiceParserUpgradeAndForceReplace(t *testing.T) {
+	dir := t.TempDir()
+	conv := filepath.Join(dir, "conversations")
+	if err := os.Mkdir(conv, 0700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	u := &rawUsage{responseID: "r", inputTokens: 10, totalOutputTokens: 5}
+	source := createTestConversationDB(t, conv, "c", [][]byte{buildStepMetadata(now, now, "model", 0, u, nil)}, nil)
+	ledgerPath := filepath.Join(dir, "usage.db")
+	svc := NewService(ServiceOptions{LedgerPath: ledgerPath, ConversationsDir: conv, SummariesPath: filepath.Join(dir, "absent.db")})
+	if _, err := svc.Ingest(); err != nil {
+		t.Fatal(err)
+	}
+	l, err := OpenLedger(ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.db.Exec("UPDATE ingest_manifests SET parser_version = 'old'"); err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+	stats, err := svc.Ingest()
+	if err != nil || stats.IngestedCount != 1 {
+		t.Fatalf("parser upgrade skipped: %v %+v", err, stats)
+	}
+	db, err := sql.Open("sqlite", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("DELETE FROM steps"); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	svc.opts.Force = true
+	if _, err := svc.Ingest(); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := svc.Summary()
+	if err != nil || summary.Overall.GenerationCount != 0 {
+		t.Fatalf("force retained stale records: %v %+v", err, summary)
 	}
 }

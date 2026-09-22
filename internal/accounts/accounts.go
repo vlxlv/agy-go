@@ -265,7 +265,7 @@ func SyncActiveAgyTokenFile() (bool, error) {
 				return nil
 			}
 		}
-		return nil
+		return errors.New("active account changed during synchronization")
 	})
 
 	return synced, err
@@ -287,7 +287,19 @@ func syncAccountToAgy(account *storage.Account) error {
 }
 
 // RemoveAccount removes an account from the pool by target selector.
-func RemoveAccount(target string) (*storage.Account, error) {
+func RemoveAccount(target string) (account *storage.Account, err error) {
+	lockFile := config.GetAgyTokenFile() + ".lock"
+	if err := config.AssertSafeNativeTokenWrite(lockFile); err != nil {
+		return nil, err
+	}
+	err = storage.WithFileLock(lockFile, true, func() error {
+		account, err = removeAccountLocked(target)
+		return err
+	})
+	return account, err
+}
+
+func removeAccountLocked(target string) (*storage.Account, error) {
 	var removed *storage.Account
 	var replacement *storage.Account
 	var wasActive bool
@@ -341,7 +353,9 @@ func RemoveAccount(target string) (*storage.Account, error) {
 	})
 	if err != nil {
 		if wasActive && replacement != nil {
-			_ = syncAccountToAgy(found)
+			if rollbackErr := syncAccountToAgy(found); rollbackErr != nil {
+				err = errors.Join(err, fmt.Errorf("restore native identity: %w", rollbackErr))
+			}
 		}
 		return nil, err
 	}
@@ -354,7 +368,19 @@ func RemoveAccount(target string) (*storage.Account, error) {
 }
 
 // SwitchAccount sets the active account, either explicitly or automatically by highest quota.
-func SwitchAccount(target string) (*storage.Account, error) {
+func SwitchAccount(target string) (account *storage.Account, err error) {
+	lockFile := config.GetAgyTokenFile() + ".lock"
+	if err := config.AssertSafeNativeTokenWrite(lockFile); err != nil {
+		return nil, err
+	}
+	err = storage.WithFileLock(lockFile, true, func() error {
+		account, err = switchAccountLocked(target)
+		return err
+	})
+	return account, err
+}
+
+func switchAccountLocked(target string) (*storage.Account, error) {
 	pool, err := storage.LoadPool()
 	if err != nil {
 		return nil, err
@@ -370,7 +396,6 @@ func SwitchAccount(target string) (*storage.Account, error) {
 			q, err := prober(acc)
 			if err == nil && q != nil {
 				acc.LastQuota = q
-				_ = auth.PersistAccountFields(acc, true, true, true)
 			}
 		}
 		pool, err = storage.LoadPool()
@@ -428,7 +453,9 @@ func SwitchAccount(target string) (*storage.Account, error) {
 	})
 	if err != nil {
 		if previous != nil {
-			_ = syncAccountToAgy(previous)
+			if rollbackErr := syncAccountToAgy(previous); rollbackErr != nil {
+				err = errors.Join(err, fmt.Errorf("restore native identity: %w", rollbackErr))
+			}
 		}
 		return nil, err
 	}
@@ -531,7 +558,6 @@ func ImportCurrent() (*storage.Account, error) {
 	if prober != nil {
 		if q, err := prober(imported); err == nil && q != nil {
 			imported.LastQuota = q
-			_ = auth.PersistAccountFields(imported, true, false, true)
 		}
 	}
 
@@ -827,7 +853,6 @@ func Login(ctx context.Context, opts LoginOptions) (*storage.Account, error) {
 	if prober != nil {
 		if q, err := prober(account); err == nil && q != nil {
 			account.LastQuota = q
-			_ = auth.PersistAccountFields(account, true, true, true)
 		}
 	}
 
@@ -870,7 +895,6 @@ func VerifyAccount(target string) (*storage.Account, string, error) {
 	if prober != nil {
 		if q, err := prober(targetAcc); err == nil && q != nil {
 			targetAcc.LastQuota = q
-			_ = auth.PersistAccountFields(targetAcc, true, true, true)
 		}
 	}
 

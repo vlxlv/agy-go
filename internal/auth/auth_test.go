@@ -3,6 +3,7 @@ package auth
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -219,7 +220,7 @@ func TestRefreshToken_MissingRefreshToken(t *testing.T) {
 	}
 
 	_, err := RefreshToken(acc)
-	if err == nil || err.Error() != "Missing refresh_token" {
+	if !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("expected 'Missing refresh_token', got %v", err)
 	}
 }
@@ -567,5 +568,71 @@ func TestRefreshToken_RotatedTokenPreserved(t *testing.T) {
 	}
 	if loaded.Accounts[0].RefreshToken != "brand-new-rotated-rf-999" {
 		t.Fatalf("rotated refresh token was not preserved: got %s", loaded.Accounts[0].RefreshToken)
+	}
+}
+
+func TestRefreshToken_RejectionClassification(t *testing.T) {
+	setupIsolatedTestDir(t)
+	oldURL, oldClient := TokenURL, HTTPClient
+	defer func() { TokenURL, HTTPClient = oldURL, oldClient }()
+	for _, tc := range []struct {
+		body     string
+		status   int
+		rejected bool
+	}{
+		{`{"error":"invalid_grant"}`, 400, true}, {`{"error":"invalid_client"}`, 400, false}, {`{"error":"temporarily_unavailable"}`, 503, false}, {`{"error":"invalid_grant"}`, 503, false},
+	} {
+		t.Run(tc.body, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			TokenURL, HTTPClient = server.URL, server.Client()
+			acc := &storage.Account{ID: "acc_1", RefreshToken: "test-refresh"}
+			pool := storage.NewEmptyPool()
+			pool.Accounts = []*storage.Account{acc}
+			if err := storage.SavePool(pool); err != nil {
+				t.Fatal(err)
+			}
+			_, err := RefreshToken(acc)
+			if err == nil || errors.Is(err, ErrInvalidCredentials) != tc.rejected {
+				t.Fatalf("classification: %v", err)
+			}
+		})
+	}
+}
+
+func TestRefreshDoesNotOverwriteNewLogin(t *testing.T) {
+	setupIsolatedTestDir(t)
+	acc := &storage.Account{ID: "acc_1", RefreshToken: "old-refresh", AccessToken: "old-access"}
+	pool := storage.NewEmptyPool()
+	pool.Accounts = []*storage.Account{acc}
+	if err := storage.SavePool(pool); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := storage.PoolTransaction(func(p *storage.Pool) error {
+			p.Accounts[0].AccessToken = "login-access"
+			p.Accounts[0].RefreshToken = "login-refresh"
+			return nil
+		}); err != nil {
+			t.Error(err)
+		}
+		_, _ = w.Write([]byte(`{"access_token":"stale-refresh-result","refresh_token":"stale-rotation","expires_in":3600}`))
+	}))
+	defer server.Close()
+	oldURL := TokenURL
+	TokenURL = server.URL
+	defer func() { TokenURL = oldURL }()
+	if _, err := RefreshToken(acc); err == nil || errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("expected concurrent update error: %v", err)
+	}
+	got, err := storage.LoadPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Accounts[0].RefreshToken != "login-refresh" || got.Accounts[0].AccessToken != "login-access" {
+		t.Fatal("new login overwritten")
 	}
 }

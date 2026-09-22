@@ -198,6 +198,9 @@ func PersistAccountFields(account *storage.Account, updateTokens, updateStatus, 
 	})
 }
 
+// ErrInvalidCredentials identifies an explicit account credential rejection.
+var ErrInvalidCredentials = errors.New("account credentials rejected")
+
 // RefreshToken refreshes the access token using refresh_token if close to expiry.
 func safeProviderReason(body []byte) string {
 	var envelope struct {
@@ -238,7 +241,7 @@ func RefreshToken(account *storage.Account) (string, error) {
 	}
 
 	if account.RefreshToken == "" {
-		return "", errors.New("Missing refresh_token")
+		return "", fmt.Errorf("%w: missing refresh_token", ErrInvalidCredentials)
 	}
 
 	lockKey := account.ID
@@ -290,7 +293,7 @@ func RefreshToken(account *storage.Account) (string, error) {
 
 		rf := account.RefreshToken
 		if rf == "" {
-			return errors.New("Missing refresh_token")
+			return fmt.Errorf("%w: missing refresh_token", ErrInvalidCredentials)
 		}
 
 		form := url.Values{
@@ -300,6 +303,7 @@ func RefreshToken(account *storage.Account) (string, error) {
 			"grant_type":    {"refresh_token"},
 		}
 
+		expectedAccessToken := account.AccessToken
 		observability.RecordAuthRefreshAttempt()
 		resp, err := HTTPClient.PostForm(TokenURL, form)
 		if err != nil {
@@ -316,6 +320,13 @@ func RefreshToken(account *storage.Account) (string, error) {
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			observability.RecordAuthRefreshFailure()
+			var rejection struct {
+				Error string `json:"error"`
+			}
+			_ = json.Unmarshal(respBody, &rejection)
+			if resp.StatusCode == http.StatusBadRequest && rejection.Error == "invalid_grant" {
+				return fmt.Errorf("%w (HTTP %d): invalid_grant", ErrInvalidCredentials, resp.StatusCode)
+			}
 			return fmt.Errorf("token refresh failed (HTTP %d%s)", resp.StatusCode, safeProviderReason(respBody))
 		}
 
@@ -339,6 +350,7 @@ func RefreshToken(account *storage.Account) (string, error) {
 			expiresIn = 3600
 		}
 
+		previous := *account
 		account.AccessToken = res.AccessToken
 		if res.RefreshToken != "" {
 			account.RefreshToken = res.RefreshToken
@@ -348,7 +360,18 @@ func RefreshToken(account *storage.Account) (string, error) {
 		updatedAt := currentNow.Unix()
 		account.UpdatedAt = &updatedAt
 
-		if err := PersistAccountFields(account, true, false, false); err != nil {
+		if err := storage.PoolTransaction(func(pool *storage.Pool) error {
+			stored := storage.FindAccount(pool, account)
+			if stored == nil || stored.RefreshToken != rf || stored.AccessToken != expectedAccessToken {
+				return errors.New("credentials changed during token refresh")
+			}
+			stored.AccessToken = account.AccessToken
+			stored.RefreshToken = account.RefreshToken
+			stored.TokenExpiry = account.TokenExpiry
+			stored.UpdatedAt = account.UpdatedAt
+			return nil
+		}); err != nil {
+			*account = previous
 			return fmt.Errorf("failed to persist refreshed tokens: %w", err)
 		}
 

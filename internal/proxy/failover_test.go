@@ -370,8 +370,8 @@ func TestExplicitFailover_TokenRefreshFailure(t *testing.T) {
 
 	loaded, _ := storage.LoadPool()
 	stored1 := storage.FindAccount(loaded, acc1)
-	if stored1.Status != "auth_error" {
-		t.Fatalf("acc_1 status = %q, want 'auth_error' on refresh failure", stored1.Status)
+	if stored1.Status != "" {
+		t.Fatalf("transient refresh failure restricted account: %q", stored1.Status)
 	}
 }
 

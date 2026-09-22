@@ -785,8 +785,10 @@ func (h *Handler) dispatchAccount(
 	if err != nil {
 		logMessage("PROXY WARN", fmt.Sprintf("Token refresh failed for %s: %v. Switching to next account...", accounts.DisplayAccountName(acc), err))
 		notifyAudit(401, "TokenRefreshFailed")
-		if persistErr := RecordAuthError(acc); persistErr != nil {
-			logMessage("PROXY WARN", "failed to persist auth restriction; continuing failover")
+		if errors.Is(err, auth.ErrInvalidCredentials) {
+			if persistErr := RecordAuthError(acc); persistErr != nil {
+				logMessage("PROXY WARN", "failed to persist auth restriction; continuing failover")
+			}
 		}
 		return DispatchOutcome{
 			Action: ActionFailoverNext,

@@ -236,15 +236,15 @@ func TestQueryQuota_PartialResponseMergesKnownWindows(t *testing.T) {
 		t.Fatalf("LoadPool failed: %v", err)
 	}
 	stored := storage.FindAccount(storedPool, acc)
-	if stored.Status != "validation_required" {
-		t.Fatalf("status = %q, want validation_required", stored.Status)
+	if stored.Status != "" {
+		t.Fatalf("restriction not cleared: %s", stored.Status)
 	}
-	if stored.ValidationURL == nil || *stored.ValidationURL != validationURL {
+	if stored.ValidationURL != nil {
 		t.Fatalf("validation URL = %v, want %q", stored.ValidationURL, validationURL)
 	}
 }
 
-func TestQueryQuota_PreservesAuthRestrictions(t *testing.T) {
+func TestQueryQuota_ClearsVerifiedAuthRestrictions(t *testing.T) {
 	setupQuotaTestDir(t)
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -273,10 +273,10 @@ func TestQueryQuota_PreservesAuthRestrictions(t *testing.T) {
 				t.Fatalf("LoadPool failed: %v", err)
 			}
 			stored := storage.FindAccount(storedPool, acc)
-			if stored.Status != status {
-				t.Fatalf("status = %q, want %q", stored.Status, status)
+			if stored.Status != "" {
+				t.Fatalf("restriction not cleared: %s", stored.Status)
 			}
-			if stored.ValidationURL == nil || *stored.ValidationURL != validationURL {
+			if stored.ValidationURL != nil {
 				t.Fatalf("validation URL = %v, want %q", stored.ValidationURL, validationURL)
 			}
 			if stored.LastQuota == nil || stored.LastQuota.Gemini5H == nil || stored.LastQuota.Gemini5H.Fraction == nil || *stored.LastQuota.Gemini5H.Fraction != 0.7 {
@@ -588,5 +588,66 @@ func TestQuotaFreshness_429InvalidationSemantics(t *testing.T) {
 	}
 	if acc.LastQuota.GeminiWeekly == nil || *acc.LastQuota.GeminiWeekly.Fraction != 0.85 {
 		t.Errorf("expected GeminiWeekly fraction 0.85 preserved, got %+v", acc.LastQuota.GeminiWeekly)
+	}
+}
+
+func TestQuotaRecoveryPreservesConcurrentRestriction(t *testing.T) {
+	setupQuotaTestDir(t)
+	until := float64(100)
+	for _, changed := range []bool{false, true} {
+		acc := &storage.Account{ID: "acc_1", AccessToken: "access", RefreshToken: "refresh", Status: "validation_required", RateLimitedUntil: &until}
+		pool := storage.NewEmptyPool()
+		pool.Accounts = []*storage.Account{acc}
+		if err := storage.SavePool(pool); err != nil {
+			t.Fatal(err)
+		}
+		if changed {
+			if err := storage.PoolTransaction(func(p *storage.Pool) error { v := float64(200); p.Accounts[0].RateLimitedUntil = &v; return nil }); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := finalizeAndPersistQuota(acc, &storage.QuotaState{}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := storage.LoadPool()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (got.Accounts[0].Status != "") != changed {
+			t.Fatalf("changed=%v status=%s", changed, got.Accounts[0].Status)
+		}
+	}
+}
+
+func TestScheduledQuotaDoesNotMutateCaller(t *testing.T) {
+	setupQuotaTestDir(t)
+	acc := &storage.Account{ID: "acc_1", AccessToken: "original"}
+	pool := storage.NewEmptyPool()
+	pool.Accounts = []*storage.Account{acc}
+	if err := storage.SavePool(pool); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	TokenRefresher = func(a *storage.Account) (string, error) {
+		a.AccessToken = "changed"
+		close(entered)
+		<-release
+		return "", errors.New("test stop")
+	}
+	BackendURLBaseProvider = func() string { return "http://127.0.0.1:1" }
+	if !ScheduleQuotaRefresh(acc) {
+		t.Fatal("not scheduled")
+	}
+	<-entered
+	if acc.AccessToken != "original" {
+		t.Error("background refresh mutated caller")
+	}
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for IsRefreshInFlight(acc.ID) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if IsRefreshInFlight(acc.ID) {
+		t.Fatal("refresh did not stop")
 	}
 }

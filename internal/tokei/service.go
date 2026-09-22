@@ -173,7 +173,7 @@ func (s *Service) Ingest() (*IngestStats, error) {
 					hasActiveWAL = true
 				}
 
-				if existing.IsComplete && !hasActiveWAL &&
+				if existing.IsComplete && existing.ParserVersion == ParserVersion && !hasActiveWAL &&
 					existing.LastScanStatus != "failed" &&
 					existing.SourceSize == fi.Size() &&
 					existing.SourceMtimeNs == fi.ModTime().UnixNano() {

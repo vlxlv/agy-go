@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1025,5 +1026,78 @@ func TestLogin_StatusOutput(t *testing.T) {
 	}
 	if strings.Contains(stdoutFail.String(), "Opening browser for Google authentication...") {
 		t.Fatalf("unexpected browser opening message in failure output: %q", stdoutFail.String())
+	}
+}
+
+func TestConcurrentSwitchKeepsNativeIdentity(t *testing.T) {
+	setupIsolatedTestDir(t)
+	expiry := float64(time.Now().Unix() + 3600)
+	pool := storage.NewEmptyPool()
+	pool.Accounts = []*storage.Account{{ID: "acc_1", AccessToken: "a", TokenExpiry: &expiry}, {ID: "acc_2", AccessToken: "b", TokenExpiry: &expiry}}
+	pool.ActiveAccountID = &pool.Accounts[0].ID
+	if err := storage.SavePool(pool); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			if _, err := SwitchAccount(id); err != nil {
+				t.Error(err)
+			}
+		}(pool.Accounts[i%2].ID)
+	}
+	wg.Wait()
+	got, err := storage.LoadPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(config.GetAgyTokenFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var token struct {
+		Token struct {
+			AccessToken string `json:"access_token"`
+		} `json:"token"`
+	}
+	if err := json.Unmarshal(data, &token); err != nil {
+		t.Fatal(err)
+	}
+	active := FindAccountByTarget(got.Accounts, *got.ActiveAccountID)
+	if token.Token.AccessToken != active.AccessToken {
+		t.Fatal("native identity differs from active account")
+	}
+}
+
+func TestVerifyDoesNotOverwriteConcurrentCredentials(t *testing.T) {
+	setupIsolatedTestDir(t)
+	old, formatter := getQuotaProber()
+	defer SetQuotaProber(old, formatter)
+	acc := &storage.Account{ID: "acc_1", AccessToken: "old-access", RefreshToken: "old-refresh"}
+	pool := storage.NewEmptyPool()
+	pool.Accounts = []*storage.Account{acc}
+	if err := storage.SavePool(pool); err != nil {
+		t.Fatal(err)
+	}
+	SetQuotaProber(func(a *storage.Account) (*storage.QuotaState, error) {
+		err := storage.PoolTransaction(func(p *storage.Pool) error {
+			p.Accounts[0].AccessToken = "new-access"
+			p.Accounts[0].RefreshToken = "new-refresh"
+			p.Accounts[0].Status = "auth_error"
+			return nil
+		})
+		return &storage.QuotaState{}, err
+	}, nil)
+	if _, _, err := VerifyAccount(acc.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := storage.LoadPool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Accounts[0].RefreshToken != "new-refresh" || got.Accounts[0].Status != "auth_error" {
+		t.Fatal("stale probe overwrote newer state")
 	}
 }

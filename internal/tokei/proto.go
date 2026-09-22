@@ -274,28 +274,30 @@ func ParseStepMetadata(stepIdx int64, b []byte) (*StepEvent, error) {
 		case 9: // usage
 			if f.wireType == 2 {
 				u, err := parseModelUsage(f.bytes, 0)
-				if err == nil {
-					ev.Usage = u
+				if err != nil {
+					return nil, err
 				}
+				ev.Usage = u
 			}
 		case 24: // model info
 			if f.wireType == 2 {
 				mFields, err := decodeFields(f.bytes, 1)
-				if err == nil {
-					for _, mf := range mFields {
-						switch mf.num {
-						case 1:
-							if mf.wireType == 0 {
-								ev.ModelID = mf.varint
-							}
-						case 7:
-							if mf.wireType == 0 {
-								ev.Provider = mf.varint
-							}
-						case 8, 12:
-							if mf.wireType == 2 && ev.ModelName == "" {
-								ev.ModelName = string(mf.bytes)
-							}
+				if err != nil {
+					return nil, err
+				}
+				for _, mf := range mFields {
+					switch mf.num {
+					case 1:
+						if mf.wireType == 0 {
+							ev.ModelID = mf.varint
+						}
+					case 7:
+						if mf.wireType == 0 {
+							ev.Provider = mf.varint
+						}
+					case 8, 12:
+						if mf.wireType == 2 && ev.ModelName == "" {
+							ev.ModelName = string(mf.bytes)
 						}
 					}
 				}
@@ -303,13 +305,17 @@ func ParseStepMetadata(stepIdx int64, b []byte) (*StepEvent, error) {
 		case 28: // retry usages
 			if f.wireType == 2 {
 				rFields, err := decodeFields(f.bytes, 1)
-				if err == nil {
-					for _, rf := range rFields {
-						if rf.num == 2 && rf.wireType == 2 {
-							ru, err := parseModelUsage(rf.bytes, 1)
-							if err == nil && ru.isTokenBearing() {
-								ev.Retries = append(ev.Retries, ru)
-							}
+				if err != nil {
+					return nil, err
+				}
+				for _, rf := range rFields {
+					if rf.num == 2 && rf.wireType == 2 {
+						ru, err := parseModelUsage(rf.bytes, 1)
+						if err != nil {
+							return nil, err
+						}
+						if ru.isTokenBearing() {
+							ev.Retries = append(ev.Retries, ru)
 						}
 					}
 				}
@@ -349,7 +355,7 @@ func ParseGenMetadata(genIdx int64, b []byte) (*GenEvent, error) {
 		if f.num == 1 && f.wireType == 2 {
 			chatFields, err := decodeFields(f.bytes, 1)
 			if err != nil {
-				continue
+				return nil, err
 			}
 			for _, cf := range chatFields {
 				switch cf.num {
@@ -360,19 +366,21 @@ func ParseGenMetadata(genIdx int64, b []byte) (*GenEvent, error) {
 				case 4:
 					if cf.wireType == 2 {
 						u, err := parseModelUsage(cf.bytes, 2)
-						if err == nil {
-							ev.Usage = u
+						if err != nil {
+							return nil, err
 						}
+						ev.Usage = u
 					}
 				case 9:
 					if cf.wireType == 2 {
 						gFields, err := decodeFields(cf.bytes, 2)
-						if err == nil {
-							for _, gf := range gFields {
-								if gf.num == 4 && gf.wireType == 2 {
-									if t, ok := parseTimestampMessage(gf.bytes, 3); ok {
-										ev.Timestamp = t
-									}
+						if err != nil {
+							return nil, err
+						}
+						for _, gf := range gFields {
+							if gf.num == 4 && gf.wireType == 2 {
+								if t, ok := parseTimestampMessage(gf.bytes, 3); ok {
+									ev.Timestamp = t
 								}
 							}
 						}
@@ -380,13 +388,17 @@ func ParseGenMetadata(genIdx int64, b []byte) (*GenEvent, error) {
 				case 17:
 					if cf.wireType == 2 {
 						rFields, err := decodeFields(cf.bytes, 2)
-						if err == nil {
-							for _, rf := range rFields {
-								if rf.num == 2 && rf.wireType == 2 {
-									ru, err := parseModelUsage(rf.bytes, 3)
-									if err == nil && ru.isTokenBearing() {
-										ev.Retries = append(ev.Retries, ru)
-									}
+						if err != nil {
+							return nil, err
+						}
+						for _, rf := range rFields {
+							if rf.num == 2 && rf.wireType == 2 {
+								ru, err := parseModelUsage(rf.bytes, 3)
+								if err != nil {
+									return nil, err
+								}
+								if ru.isTokenBearing() {
+									ev.Retries = append(ev.Retries, ru)
 								}
 							}
 						}

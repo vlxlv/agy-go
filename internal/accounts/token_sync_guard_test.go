@@ -23,6 +23,7 @@ func TestNativeTokenSync_ProductionModeCanonicalSucceeds(t *testing.T) {
 
 	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)
+	t.Setenv("AGY_GEMINI_DIR", "")
 
 	dataDir := filepath.Join(fakeHome, ".local", "share", "agy-pool")
 	if err := os.MkdirAll(dataDir, 0700); err != nil {

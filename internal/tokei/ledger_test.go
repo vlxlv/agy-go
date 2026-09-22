@@ -402,3 +402,66 @@ func TestLedger_SchemaMigrationV1ToV2(t *testing.T) {
 		t.Errorf("expected 1 record preserved, got %d", vReport.TotalRecords)
 	}
 }
+
+func TestLedgerSnapshotCorrectionAndRollback(t *testing.T) {
+	l, err := OpenLedger(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	m := &SourceManifest{ConversationID: "c", IsComplete: true, Status: "completed"}
+	a := &UsageRecord{ConversationID: "c", GenerationID: "message:m", InputTokens: 100, VisibleOutputTokens: 10}
+	if err := l.CommitIngest(m, []*UsageRecord{a}); err != nil {
+		t.Fatal(err)
+	}
+	// Identity upgrade and downward correction must replace the old observation.
+	b := &UsageRecord{ConversationID: "c", GenerationID: "response:r", InputTokens: 10, VisibleOutputTokens: 100}
+	if err := l.CommitIngest(m, []*UsageRecord{b}); err != nil {
+		t.Fatal(err)
+	}
+	sum, err := l.GetSummary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Overall.GenerationCount != 1 || sum.Overall.InputTokens != 10 || sum.Overall.TotalTokens != 110 {
+		t.Fatalf("incorrect corrected snapshot: %+v", sum.Overall)
+	}
+	// A failed replacement must retain the last successful snapshot.
+	if err := l.CommitIngest(m, []*UsageRecord{{ConversationID: "other", GenerationID: "bad"}}); err == nil {
+		t.Fatal("accepted foreign record")
+	}
+	sum, err = l.GetSummary()
+	if err != nil || sum.Overall.TotalTokens != 110 {
+		t.Fatalf("rollback failed: %v %+v", err, sum)
+	}
+	if err := l.CommitIngest(m, nil); err != nil {
+		t.Fatal(err)
+	}
+	sum, err = l.GetSummary()
+	if err != nil || sum.Overall.GenerationCount != 0 {
+		t.Fatalf("deleted generation retained: %v %+v", err, sum)
+	}
+}
+
+func TestLedgerUnknownOutputBreakdown(t *testing.T) {
+	l, err := OpenLedger(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	r := &UsageRecord{ConversationID: "c", GenerationID: "r", TotalOutputTokens: 20}
+	if err := l.CommitIngest(&SourceManifest{ConversationID: "c", IsComplete: true, Status: "completed"}, []*UsageRecord{r}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := l.Verify()
+	if err != nil || !report.Valid {
+		t.Fatalf("unknown breakdown rejected: %v %+v", err, report)
+	}
+	sum, err := l.GetSummary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Overall.VisibleOutputTokens != 0 || sum.Overall.ReasoningTokens != 0 || sum.Overall.TotalTokens != 20 {
+		t.Fatal("invented output breakdown")
+	}
+}

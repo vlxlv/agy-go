@@ -178,3 +178,39 @@ func TestReader_ActiveWALDetection(t *testing.T) {
 		t.Errorf("expected status 'active', got %s", res.Status)
 	}
 }
+
+func TestReaderIdentityAliasesAndMalformedSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	early := &rawUsage{messageID: "m", inputTokens: 10, totalOutputTokens: 20}
+	later := &rawUsage{messageID: "m", responseID: "r", inputTokens: 10, totalOutputTokens: 20}
+	path := createTestConversationDB(t, dir, "c", [][]byte{buildStepMetadata(now, now, "model", 0, early, nil)}, [][]byte{buildGenMetadata(now, "model", 0, later, nil)})
+	result, err := NewReader("").ReadConversation(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Records) != 1 || result.Records[0].GenerationID != "response:r" {
+		t.Fatalf("aliases counted twice: %+v", result.Records)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec("UPDATE steps SET metadata = ?", []byte{0xff}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if _, err := NewReader("").ReadConversation(path, nil); err == nil {
+		t.Fatal("malformed snapshot accepted")
+	}
+}
+
+func TestReaderRejectsConflictingGenerationAliases(t *testing.T) {
+	now := time.Now()
+	a := &rawUsage{responseID: "a", messageID: "shared", inputTokens: 10}
+	b := &rawUsage{responseID: "b", messageID: "shared", inputTokens: 20}
+	path := createTestConversationDB(t, t.TempDir(), "c", [][]byte{buildStepMetadata(now, now, "model", 0, a, []*rawUsage{b})}, nil)
+	if _, err := NewReader("").ReadConversation(path, nil); err == nil {
+		t.Fatal("distinct generations silently merged")
+	}
+}

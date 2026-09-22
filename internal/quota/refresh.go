@@ -373,6 +373,14 @@ func finalizeAndPersistQuota(account *storage.Account, quotaData *storage.QuotaS
 		stored := storage.FindAccount(pool, account)
 		if stored != nil {
 			stored.LastQuota = quotaData
+			// Only clear the restriction observed by this probe, never a newer one.
+			if stored.AccessToken == account.AccessToken && stored.RefreshToken == account.RefreshToken &&
+				stored.Status == account.Status && reflect.DeepEqual(stored.RateLimitedUntil, account.RateLimitedUntil) &&
+				reflect.DeepEqual(stored.ValidationURL, account.ValidationURL) {
+				stored.Status = ""
+				stored.RateLimitedUntil = nil
+				stored.ValidationURL = nil
+			}
 		}
 		return nil
 	})
@@ -442,6 +450,7 @@ func ScheduleQuotaRefresh(account *storage.Account, now ...float64) bool {
 	refreshInFlight[key] = true
 	refreshMu.Unlock()
 
+	identity := &storage.Account{ID: account.ID, Email: account.Email}
 	go func() {
 		defer func() {
 			refreshMu.Lock()
@@ -449,7 +458,15 @@ func ScheduleQuotaRefresh(account *storage.Account, now ...float64) bool {
 			refreshMu.Unlock()
 		}()
 
-		_, err := QueryQuota(account)
+		pool, err := storage.LoadPool()
+		if err == nil {
+			stored := storage.FindAccount(pool, identity)
+			if stored == nil {
+				err = errors.New("account no longer exists")
+			} else {
+				_, err = QueryQuota(stored)
+			}
+		}
 		refreshMu.Lock()
 		defer refreshMu.Unlock()
 		if err == nil {

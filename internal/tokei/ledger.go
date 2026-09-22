@@ -332,6 +332,12 @@ func (l *Ledger) CommitIngest(manifest *SourceManifest, records []*UsageRecord) 
 
 	now := time.Now().UTC()
 
+	// Reader supplies a complete, validated SQLite snapshot, including active sources.
+	// Replace this conversation atomically so corrections and identity upgrades remove old rows.
+	if _, err := tx.Exec("DELETE FROM usage_records WHERE conversation_id = ?", manifest.ConversationID); err != nil {
+		return fmt.Errorf("replace conversation snapshot: %w", err)
+	}
+
 	// Insert or replace generation records
 	recordStmt, err := tx.Prepare(`
 		INSERT INTO usage_records (
@@ -342,18 +348,6 @@ func (l *Ledger) CommitIngest(manifest *SourceManifest, records []*UsageRecord) 
 			visible_output_tokens, reasoning_tokens, total_output_tokens, total_tokens,
 			created_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(generation_id) DO UPDATE SET
-			step_index = MAX(usage_records.step_index, excluded.step_index),
-			input_tokens = MAX(usage_records.input_tokens, excluded.input_tokens),
-			cache_read_tokens = MAX(usage_records.cache_read_tokens, excluded.cache_read_tokens),
-			cache_creation_tokens = MAX(usage_records.cache_creation_tokens, excluded.cache_creation_tokens),
-			visible_output_tokens = MAX(usage_records.visible_output_tokens, excluded.visible_output_tokens),
-			reasoning_tokens = MAX(usage_records.reasoning_tokens, excluded.reasoning_tokens),
-			total_output_tokens = MAX(usage_records.total_output_tokens, excluded.total_output_tokens),
-			total_tokens = MAX(usage_records.total_tokens, excluded.total_tokens),
-			model = CASE WHEN usage_records.model = 'gemini-internal-model' AND excluded.model != 'gemini-internal-model' THEN excluded.model ELSE usage_records.model END,
-			workspace_uri = CASE WHEN usage_records.workspace_uri = '' AND excluded.workspace_uri != '' THEN excluded.workspace_uri ELSE usage_records.workspace_uri END,
-			project_id = CASE WHEN usage_records.project_id = 'unknown' AND excluded.project_id != 'unknown' THEN excluded.project_id ELSE usage_records.project_id END
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare record stmt: %w", err)
@@ -362,6 +356,12 @@ func (l *Ledger) CommitIngest(manifest *SourceManifest, records []*UsageRecord) 
 
 	var firstTS, lastTS *time.Time
 	for _, r := range records {
+		if r == nil || r.ConversationID != manifest.ConversationID {
+			return fmt.Errorf("record does not belong to conversation %s", manifest.ConversationID)
+		}
+		normalized := *r
+		normalized.Normalize()
+		r = &normalized
 		if !r.IsTokenBearing() {
 			continue
 		}
@@ -727,15 +727,15 @@ func (l *Ledger) Verify() (*VerifyReport, error) {
 	_ = l.db.QueryRow("SELECT COUNT(*) FROM ingest_manifests").Scan(&rep.TotalManifests)
 	_ = l.db.QueryRow("SELECT COUNT(*) FROM conversation_metadata").Scan(&rep.TotalMetadata)
 
-	// 3. Invariant check: TotalOutputTokens == VisibleOutputTokens + ReasoningTokens
+	// 3. Invariant check: TotalOutputTokens >= known VisibleOutputTokens + ReasoningTokens
 	rowOut := l.db.QueryRow(`
 		SELECT COUNT(*) FROM usage_records
-		WHERE total_output_tokens != (visible_output_tokens + reasoning_tokens)
+		WHERE total_output_tokens < (visible_output_tokens + reasoning_tokens)
 	`)
 	_ = rowOut.Scan(&rep.DiscrepantOutputTokens)
 	if rep.DiscrepantOutputTokens > 0 {
 		rep.Valid = false
-		rep.Errors = append(rep.Errors, fmt.Sprintf("%d records have inconsistent total_output_tokens != visible + reasoning", rep.DiscrepantOutputTokens))
+		rep.Errors = append(rep.Errors, fmt.Sprintf("%d records have total_output_tokens below visible + reasoning", rep.DiscrepantOutputTokens))
 	}
 
 	// 4. Invariant check: TotalTokens == InputTokens + CacheReadTokens + TotalOutputTokens

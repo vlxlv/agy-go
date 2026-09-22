@@ -119,16 +119,21 @@ func (r *Reader) ReadConversation(dbPath string, meta *ConversationMeta) (*Conve
 		return nil, fmt.Errorf("open read-only sqlite %s: %w", dbPath, err)
 	}
 	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin source snapshot: %w", err)
+	}
+	defer tx.Rollback()
 
 	var schemaVer int
-	if err := db.QueryRow("PRAGMA schema_version;").Scan(&schemaVer); err != nil {
+	if err := tx.QueryRow("PRAGMA schema_version;").Scan(&schemaVer); err != nil {
 		return nil, fmt.Errorf("validate sqlite %s: %w", dbPath, err)
 	}
 
 	// 1. Fallback base timestamp from trajectory_metadata_blob
 	var baseTimestamp time.Time
 	var trajBlob []byte
-	row := db.QueryRow("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'")
+	row := tx.QueryRow("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'")
 	if err := row.Scan(&trajBlob); err == nil && len(trajBlob) > 0 {
 		if t, ok := ParseTrajectoryTimestamp(trajBlob); ok {
 			baseTimestamp = t
@@ -148,63 +153,144 @@ func (r *Reader) ReadConversation(dbPath string, meta *ConversationMeta) (*Conve
 	}
 
 	// 2. Read steps table
-	stepRows, err := db.Query("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC")
+	stepRows, err := tx.Query("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC")
 	var stepEvents []*StepEvent
 	var highestStepIdx int64
-	if err == nil {
-		defer stepRows.Close()
-		for stepRows.Next() {
-			var idx int64
-			var blob []byte
-			if err := stepRows.Scan(&idx, &blob); err != nil {
-				continue
+	if err != nil {
+		return nil, fmt.Errorf("read step metadata: %w", err)
+	}
+	defer stepRows.Close()
+	for stepRows.Next() {
+		var idx int64
+		var blob []byte
+		if err := stepRows.Scan(&idx, &blob); err != nil {
+			return nil, err
+		}
+		if idx > highestStepIdx {
+			highestStepIdx = idx
+		}
+		if len(blob) > 0 {
+			ev, err := ParseStepMetadata(idx, blob)
+			if err != nil {
+				return nil, fmt.Errorf("decode step %d: %w", idx, err)
 			}
-			if idx > highestStepIdx {
-				highestStepIdx = idx
-			}
-			if len(blob) > 0 {
-				ev, err := ParseStepMetadata(idx, blob)
-				if err == nil {
-					stepEvents = append(stepEvents, ev)
-				}
-			}
+			stepEvents = append(stepEvents, ev)
 		}
 	}
 
+	if err := stepRows.Err(); err != nil {
+		return nil, err
+	}
+	stepRows.Close()
+
 	// 3. Read gen_metadata table
-	genRows, err := db.Query("SELECT idx, data FROM gen_metadata ORDER BY idx ASC")
+	genRows, err := tx.Query("SELECT idx, data FROM gen_metadata ORDER BY idx ASC")
 	var genEvents []*GenEvent
 	var highestGenIdx int64
-	if err == nil {
-		defer genRows.Close()
-		for genRows.Next() {
-			var idx int64
-			var blob []byte
-			if err := genRows.Scan(&idx, &blob); err != nil {
-				continue
+	if err != nil {
+		return nil, fmt.Errorf("read gen metadata: %w", err)
+	}
+	defer genRows.Close()
+	for genRows.Next() {
+		var idx int64
+		var blob []byte
+		if err := genRows.Scan(&idx, &blob); err != nil {
+			return nil, err
+		}
+		if idx > highestGenIdx {
+			highestGenIdx = idx
+		}
+		if len(blob) > 0 {
+			ev, err := ParseGenMetadata(idx, blob)
+			if err != nil {
+				return nil, fmt.Errorf("decode gen %d: %w", idx, err)
 			}
-			if idx > highestGenIdx {
-				highestGenIdx = idx
-			}
-			if len(blob) > 0 {
-				ev, err := ParseGenMetadata(idx, blob)
-				if err == nil {
-					genEvents = append(genEvents, ev)
-				}
-			}
+			genEvents = append(genEvents, ev)
 		}
 	}
+
+	if err := genRows.Err(); err != nil {
+		return nil, err
+	}
+	genRows.Close()
 
 	// 4. Deduplicate across steps and gen_metadata
 	// Key: Generation identity (e.g. "response:<id>", "provider:<id>", "message:<id>")
 	recordMap := make(map[string]*UsageRecord)
 	var orderedKeys []string
 
+	// Join all known aliases before counting: an event may acquire a response ID later.
+	parents := make(map[string]string)
+	var root func(string) string
+	root = func(id string) string {
+		if parents[id] == "" {
+			parents[id] = id
+		}
+		if parents[id] != id {
+			parents[id] = root(parents[id])
+		}
+		return parents[id]
+	}
+	link := func(u *rawUsage) error {
+		if u == nil {
+			return nil
+		}
+		ids := []string{}
+		if u.responseID != "" {
+			ids = append(ids, "response:"+u.responseID)
+		}
+		if u.providerAssignedMessageID != "" {
+			ids = append(ids, "provider:"+u.providerAssignedMessageID)
+		}
+		if u.messageID != "" {
+			ids = append(ids, "message:"+u.messageID)
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		for _, id := range ids[1:] {
+			a, b := root(ids[0]), root(id)
+			if a != b && ((strings.HasPrefix(a, "response:") && strings.HasPrefix(b, "response:")) ||
+				(strings.HasPrefix(a, "provider:") && strings.HasPrefix(b, "provider:"))) {
+				return fmt.Errorf("ambiguous generation aliases: distinct generation IDs share an alias")
+			}
+			// Lexical order prefers response, then provider, then message identities.
+			if a < b {
+				a, b = b, a
+			}
+			parents[b] = a
+		}
+		return nil
+	}
+	for _, ev := range stepEvents {
+		if err := link(ev.Usage); err != nil {
+			return nil, err
+		}
+		for _, u := range ev.Retries {
+			if err := link(u); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for _, ev := range genEvents {
+		if err := link(ev.Usage); err != nil {
+			return nil, err
+		}
+		for _, u := range ev.Retries {
+			if err := link(u); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	upsert := func(u *rawUsage, stepIdx int64, ts time.Time, modelName string, modelID uint64, provider uint64) {
 		if u == nil || !u.isTokenBearing() {
 			return
 		}
 		id := u.primaryIdentity()
+		if id != "" {
+			id = root(id)
+		}
 		if id == "" {
 			// Fallback generation identity if response_id and message_id are both absent
 			id = fmt.Sprintf("step:%s:%d", cid, stepIdx)
