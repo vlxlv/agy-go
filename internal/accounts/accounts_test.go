@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -561,7 +560,7 @@ func TestLoginFlow(t *testing.T) {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		mockJWT := "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ICJsb2dpbl91c2VyQGdtYWlsLmNvbSJ9."
+		mockJWT := loginTestToken("login_user@gmail.com", nil)
 		resp := map[string]any{
 			"access_token":  "login-at-123",
 			"refresh_token": "login-rf-456",
@@ -576,7 +575,7 @@ func TestLoginFlow(t *testing.T) {
 	opts := LoginOptions{
 		TokenEndpoint: server.URL,
 		BrowserOpener: func(url string) error { return nil },
-		PromptFn: func(authURL string) (string, error) {
+		PromptFn: func(_ context.Context, authURL string) (string, error) {
 			return "valid-test-code", nil
 		},
 		Timeout:   5 * time.Second,
@@ -603,14 +602,14 @@ func TestLogin_NativeSyncFailureIsObservable(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"access_token": "access-secret", "refresh_token": "refresh-secret",
-			"id_token": "", "expires_in": 3600,
+			"id_token": loginTestToken("test@example.com", nil), "expires_in": 3600,
 		})
 	}))
 	defer server.Close()
 	acc, err := Login(context.Background(), LoginOptions{
 		TokenEndpoint: server.URL,
 		BrowserOpener: func(string) error { return nil },
-		PromptFn:      func(string) (string, error) { return "code", nil },
+		PromptFn:      func(context.Context, string) (string, error) { return "code", nil },
 		Timeout:       2 * time.Second, PortRange: [2]int{18600, 18650},
 	})
 	if err == nil || acc == nil || !strings.Contains(err.Error(), "native agy synchronization failed") {
@@ -970,7 +969,7 @@ func TestLogin_StatusOutput(t *testing.T) {
 	setupIsolatedTestDir(t)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mockJWT := "eyJhbGciOiJub25lIn0.eyJlbWFpbCI6ICJzdGF0dXNfdXNlckBnbWFpbC5jb20ifQ."
+		mockJWT := loginTestToken("status_user@gmail.com", nil)
 		resp := map[string]any{
 			"access_token":  "status-at-123",
 			"refresh_token": "status-rf-456",
@@ -987,7 +986,7 @@ func TestLogin_StatusOutput(t *testing.T) {
 	optsSuccess := LoginOptions{
 		TokenEndpoint: server.URL,
 		BrowserOpener: func(url string) error { return nil },
-		PromptFn: func(authURL string) (string, error) {
+		PromptFn: func(_ context.Context, authURL string) (string, error) {
 			return "valid-code", nil
 		},
 		Timeout:   5 * time.Second,
@@ -1014,7 +1013,7 @@ func TestLogin_StatusOutput(t *testing.T) {
 	optsFail := LoginOptions{
 		TokenEndpoint: server.URL,
 		BrowserOpener: func(url string) error { return errors.New("headless failure") },
-		PromptFn: func(authURL string) (string, error) {
+		PromptFn: func(_ context.Context, authURL string) (string, error) {
 			return "valid-code", nil
 		},
 		Timeout:   5 * time.Second,
@@ -1124,7 +1123,7 @@ func TestLoginCallbackStateAndPKCE(t *testing.T) {
 			w.WriteHeader(400)
 			return
 		}
-		io.WriteString(w, `{"access_token":"access","refresh_token":"refresh","expires_in":3600,"id_token":"eyJhbGciOiJub25lIn0.eyJlbWFpbCI6InRlc3RAZXhhbXBsZS5jb20ifQ."}`)
+		json.NewEncoder(w).Encode(map[string]any{"access_token": "access", "refresh_token": "refresh", "expires_in": 3600, "id_token": loginTestToken("test@example.com", nil)})
 	}))
 	defer tokenServer.Close()
 	_, err := Login(context.Background(), LoginOptions{

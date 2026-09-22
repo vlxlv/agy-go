@@ -442,7 +442,8 @@ func TestTop_KeyHandling_Q_Plus_Minus_R(t *testing.T) {
 	}
 
 	// Pass keystrokes: '+' (faster), '-' (slower), 'r' (refresh), 'q' (quit)
-	in := bytes.NewBufferString("+ - r q\n")
+	// More input than keyChan can hold also exercises cancellation of a blocked sender.
+	in := bytes.NewBufferString("+ - r q\n" + strings.Repeat("x", 1024))
 	var out, errBuf bytes.Buffer
 
 	opts := TopOptions{

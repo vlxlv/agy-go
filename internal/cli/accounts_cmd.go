@@ -800,14 +800,14 @@ func LoginCmdWithOptions(stdin io.Reader, stdout, stderr io.Writer, extraOpts ac
 	opts.BrowserOpener = wrappedOpener
 
 	if opts.PromptFn == nil {
-		opts.PromptFn = func(authURL string) (string, error) {
+		opts.PromptFn = func(ctx context.Context, authURL string) (string, error) {
 			if browserOpened {
 				return "", nil
 			}
 			fmt.Fprintln(stdout, "")
 			fmt.Fprintln(stdout, "Paste the authorization code or callback URL:")
 			fmt.Fprint(stdout, "> ")
-			scanner := bufio.NewScanner(stdin)
+			scanner := bufio.NewScanner(inputReader{ctx: ctx, source: stdin})
 			if scanner.Scan() {
 				return strings.TrimSpace(scanner.Text()), nil
 			}

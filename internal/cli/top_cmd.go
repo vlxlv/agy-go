@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -205,9 +206,14 @@ func RunTop(ctx *daemon.InstanceContext, opts TopOptions) int {
 
 	keyChan := make(chan rune, 16)
 	readCtx, cancelRead := context.WithCancel(context.Background())
-	defer cancelRead()
+	readDone := make(chan struct{})
+	var inputErr error // Published by closing keyChan.
+	defer func() { cancelRead(); <-readDone }()
 
 	go func() {
+		defer close(readDone)
+		defer close(keyChan)
+		reader := inputReader{ctx: readCtx, source: opts.Stdin}
 		buf := make([]byte, 16)
 		for {
 			select {
@@ -215,13 +221,17 @@ func RunTop(ctx *daemon.InstanceContext, opts TopOptions) int {
 				return
 			default:
 			}
-			n, err := opts.Stdin.Read(buf)
+			n, err := reader.Read(buf)
 			if err != nil {
-				close(keyChan)
+				inputErr = err
 				return
 			}
 			for i := 0; i < n; i++ {
-				keyChan <- rune(buf[i])
+				select {
+				case keyChan <- rune(buf[i]):
+				case <-readCtx.Done():
+					return
+				}
 			}
 		}
 	}()
@@ -268,6 +278,10 @@ func RunTop(ctx *daemon.InstanceContext, opts TopOptions) int {
 
 		case key, ok := <-keyChan:
 			if !ok {
+				if inputErr != nil && !errors.Is(inputErr, io.EOF) && !errors.Is(inputErr, context.Canceled) {
+					fmt.Fprintf(opts.Stderr, "[Error] input: %v\n", inputErr)
+					return 1
+				}
 				// EOF on stdin
 				return 0
 			}

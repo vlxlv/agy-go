@@ -432,9 +432,9 @@ func setupMockOAuthTokenServer(t *testing.T, expectedCode, userEmail, accessToke
 			_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
 			return
 		}
-		payloadJSON, _ := json.Marshal(map[string]any{"email": userEmail})
+		payloadJSON, _ := json.Marshal(map[string]any{"email": userEmail, "email_verified": true, "sub": "test-subject", "iss": "https://accounts.google.com", "aud": auth.GetClientID(), "exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix()})
 		payloadB64 := base64.RawURLEncoding.EncodeToString(payloadJSON)
-		mockJWT := fmt.Sprintf("eyJhbGciOiJub25lIn0.%s.", payloadB64)
+		mockJWT := fmt.Sprintf("eyJhbGciOiJSUzI1NiJ9.%s.c2ln", payloadB64)
 		resp := map[string]any{
 			"access_token":  accessToken,
 			"refresh_token": refreshToken,

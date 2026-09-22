@@ -571,7 +571,8 @@ func ImportCurrent() (*storage.Account, error) {
 type LoginOptions struct {
 	AuthEndpoint  string
 	TokenEndpoint string
-	PromptFn      func(authURL string) (string, error)
+	// PromptFn must return when ctx is canceled.
+	PromptFn      func(ctx context.Context, authURL string) (string, error)
 	BrowserOpener func(url string) error
 	PortRange     [2]int // inclusive start, end
 	Timeout       time.Duration
@@ -628,6 +629,12 @@ func Login(ctx context.Context, opts LoginOptions) (*storage.Account, error) {
 	tokenEndpoint := opts.TokenEndpoint
 	if tokenEndpoint == "" {
 		tokenEndpoint = auth.TokenURL
+	}
+	if tokenEndpoint != "https://oauth2.googleapis.com/token" {
+		u, err := url.Parse(tokenEndpoint)
+		if err != nil || !config.IsTestMode() || (u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost") {
+			return nil, errors.New("login requires the Google HTTPS token endpoint")
+		}
 	}
 	opener := opts.BrowserOpener
 	if opener == nil {
@@ -732,10 +739,19 @@ func Login(ctx context.Context, opts LoginOptions) (*storage.Account, error) {
 	}
 
 	// If prompt function provided, run it concurrently
+	var stopPrompt func()
 	if opts.PromptFn != nil {
+		promptCtx, cancelPrompt := context.WithCancel(ctx)
+		promptDone := make(chan struct{})
+		stopPrompt = func() { cancelPrompt(); <-promptDone }
+		defer stopPrompt()
 		go func() {
-			val, pErr := opts.PromptFn(authURL)
+			defer close(promptDone)
+			val, pErr := opts.PromptFn(promptCtx, authURL)
 			if pErr != nil {
+				if promptCtx.Err() != nil {
+					return
+				}
 				select {
 				case errChan <- pErr:
 				default:
@@ -773,6 +789,9 @@ func Login(ctx context.Context, opts LoginOptions) (*storage.Account, error) {
 	case c := <-codeChan:
 		code = c
 	}
+	if stopPrompt != nil {
+		stopPrompt()
+	}
 
 	// Exchange code for tokens
 	tokenForm := url.Values{
@@ -789,7 +808,9 @@ func Login(ctx context.Context, opts LoginOptions) (*storage.Account, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := auth.HTTPClient.Do(req)
+	client := *auth.HTTPClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("OAuth token exchange failed: %w", err)
 	}
@@ -817,18 +838,16 @@ func Login(ctx context.Context, opts LoginOptions) (*storage.Account, error) {
 	if tokenRes.RefreshToken == "" {
 		return nil, errors.New("Google did not return a refresh_token. Please revoke access or re-run with prompt=consent")
 	}
-
-	claims := auth.DecodeJWTPayload(tokenRes.IDToken)
-	email, _ := claims["email"].(string)
-	if email == "" {
-		email = fmt.Sprintf("user_%d@gmail.com", time.Now().Unix())
+	if tokenRes.AccessToken == "" || tokenRes.ExpiresIn <= 0 {
+		return nil, errors.New("Google returned missing or invalid access token metadata")
+	}
+	email, err := tokenEndpointEmail(tokenRes.IDToken, auth.GetClientID(), time.Now())
+	if err != nil {
+		return nil, err
 	}
 
 	now := time.Now().Unix()
 	expiresIn := tokenRes.ExpiresIn
-	if expiresIn <= 0 {
-		expiresIn = 3600
-	}
 	expiryTS := float64(now) + expiresIn
 
 	var account *storage.Account
