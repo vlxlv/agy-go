@@ -339,3 +339,54 @@ func TestServiceParserUpgradeAndForceReplace(t *testing.T) {
 		t.Fatalf("force retained stale records: %v %+v", err, summary)
 	}
 }
+
+func TestCatalogWALChangeAndQueryFailure(t *testing.T) {
+	dir := t.TempDir()
+	conv := filepath.Join(dir, "conversations")
+	if err := os.Mkdir(conv, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := createTestSummariesDB(t, dir, []*ConversationMeta{{ConversationID: "c", Title: "before"}})
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;"); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(ServiceOptions{LedgerPath: filepath.Join(dir, "usage.db"), ConversationsDir: conv, SummariesPath: path})
+	if _, err := svc.Ingest(); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.Stat(path)
+	if _, err := db.Exec("UPDATE conversation_summaries SET title='after'"); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.Stat(path)
+	if before.Size() != after.Size() || before.ModTime() != after.ModTime() {
+		t.Fatal("fixture changed main DB instead of WAL")
+	}
+	if _, err := svc.Ingest(); err != nil {
+		t.Fatal(err)
+	}
+	l, err := OpenLedgerReadOnly(svc.opts.LedgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	catalog, err := l.GetAllConversationMetadata()
+	if err != nil || catalog["c"].Title != "after" {
+		t.Fatalf("stale WAL catalog: %+v %v", catalog, err)
+	}
+	if _, err := db.Exec("DROP TABLE conversation_summaries"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Ingest(); err == nil {
+		t.Fatal("bad catalog schema silently accepted")
+	}
+	catalog, err = l.GetAllConversationMetadata()
+	if err != nil || catalog["c"].Title != "after" {
+		t.Fatal("failed catalog scan destroyed cached metadata")
+	}
+}

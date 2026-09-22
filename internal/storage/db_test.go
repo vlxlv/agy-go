@@ -181,3 +181,20 @@ func TestCascadeDeletion(t *testing.T) {
 		t.Fatalf("foreign key CASCADE failed: rt=%d, q=%d", rtCount, qCount)
 	}
 }
+
+func TestAutoMigrationFailureDoesNotCreateEmptyState(t *testing.T) {
+	for _, name := range []string{"accounts.json", "agy-pool-accounts.json"} {
+		t.Run(name, func(t *testing.T) {
+			dir := setupTestStorage(t)
+			if err := os.WriteFile(filepath.Join(dir, name), []byte("{broken"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := GetStateDB(); err == nil {
+				t.Fatal("corrupt source silently replaced by empty state")
+			}
+			if _, err := os.Stat(filepath.Join(dir, "state.db")); !os.IsNotExist(err) {
+				t.Fatalf("state.db was created: %v", err)
+			}
+		})
+	}
+}

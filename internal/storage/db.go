@@ -242,9 +242,13 @@ func GetStateDB() (*StateDB, error) {
 		splitAccounts := filepath.Join(dataDir, "accounts.json")
 		legacyAccounts := filepath.Join(dataDir, "agy-pool-accounts.json")
 		if _, err := os.Stat(splitAccounts); err == nil {
-			_, _ = MigrateSplitJSONToDB(dataDir, dataDir)
+			if _, err := MigrateSplitJSONToDB(dataDir, dataDir); err != nil {
+				return nil, fmt.Errorf("migrate split state: %w", err)
+			}
 		} else if _, err := os.Stat(legacyAccounts); err == nil {
-			_, _ = MigrateLegacyPool(legacyAccounts, dataDir)
+			if _, err := MigrateLegacyPool(legacyAccounts, dataDir); err != nil {
+				return nil, fmt.Errorf("migrate legacy state: %w", err)
+			}
 		}
 	}
 

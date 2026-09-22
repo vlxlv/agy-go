@@ -1,8 +1,10 @@
 package tokei
 
 import (
+	"bytes"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -463,5 +465,108 @@ func TestLedgerUnknownOutputBreakdown(t *testing.T) {
 	}
 	if sum.Overall.VisibleOutputTokens != 0 || sum.Overall.ReasoningTokens != 0 || sum.Overall.TotalTokens != 20 {
 		t.Fatal("invented output breakdown")
+	}
+}
+
+func TestReadOnlyLedgerDoesNotCreateOrModifyFiles(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing", "usage.db")
+	if l, err := OpenLedgerReadOnly(missing); err == nil {
+		l.Close()
+		t.Fatal("created missing ledger")
+	}
+	if _, err := os.Stat(filepath.Dir(missing)); !os.IsNotExist(err) {
+		t.Fatalf("created parent: %v", err)
+	}
+	path := filepath.Join(dir, "usage?#.db")
+	if err := os.Chmod(dir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	l, err := OpenLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+	st, _ := os.Stat(dir)
+	if st.Mode().Perm() != 0750 {
+		t.Fatal("changed existing parent permissions")
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err = OpenLedgerReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.GetStatus(0); err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := l.Verify(); err != nil || !rep.Valid {
+		t.Fatalf("verify: %+v %v", rep, err)
+	}
+	if _, err := l.GetSummary(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.db.Exec("DELETE FROM schema_migrations"); err == nil {
+		t.Fatal("read-only ledger allowed write")
+	}
+	l.Close()
+	after, _ := os.ReadFile(path)
+	if !bytes.Equal(before, after) {
+		t.Fatal("query changed ledger")
+	}
+}
+
+func TestLedgerMigrationRollsBackAndRejectsFutureSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.db")
+	l, err := OpenLedger(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if _, err := l.db.Exec("INSERT INTO schema_migrations VALUES (99, CURRENT_TIMESTAMP)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.migrate(); err == nil {
+		t.Fatal("accepted future schema")
+	}
+	if _, err := l.db.Exec(`DELETE FROM schema_migrations WHERE version > 1;
+ ALTER TABLE ingest_manifests DROP COLUMN last_scan_at;
+ CREATE TRIGGER reject_v2 BEFORE INSERT ON schema_migrations BEGIN SELECT RAISE(ABORT, 'test migration failure'); END;`); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.migrate(); err == nil {
+		t.Fatal("expected failed migration")
+	}
+	var count int
+	if err := l.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('ingest_manifests') WHERE name='last_scan_at'").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("failed migration left partial ALTER TABLE")
+	}
+}
+
+func TestLedgerReportsPropagateMissingTable(t *testing.T) {
+	l, err := OpenLedger(filepath.Join(t.TempDir(), "usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if _, err := l.db.Exec("DROP TABLE conversation_metadata"); err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := l.Verify(); err == nil {
+		t.Fatalf("invalid schema reported as success: %+v", rep)
+	}
+	if _, err := l.GetStatus(0); err == nil {
+		t.Fatal("status ignored missing table")
+	}
+	if _, err := l.db.Exec("DROP TABLE usage_records"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.GetSummary(); err == nil {
+		t.Fatal("summary ignored missing table")
 	}
 }

@@ -3,6 +3,7 @@ package tokei
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -29,9 +30,8 @@ func OpenLedger(dbPath string) (*Ledger, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create ledger directory %s: %w", dir, err)
 	}
-	_ = os.Chmod(dir, 0o700)
 
-	dsn := fmt.Sprintf("file:%s?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)", dbPath)
+	dsn := fmt.Sprintf("%s?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)", (&url.URL{Scheme: "file", Path: dbPath}).String())
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open ledger %s: %w", dbPath, err)
@@ -68,6 +68,25 @@ func OpenLedger(dbPath string) (*Ledger, error) {
 	return l, nil
 }
 
+// OpenLedgerReadOnly opens an existing ledger without creating, migrating, or chmodding it.
+func OpenLedgerReadOnly(dbPath string) (*Ledger, error) {
+	dsn := (&url.URL{Scheme: "file", Path: dbPath}).String() + "?mode=ro&_pragma=busy_timeout(5000)&_pragma=query_only(ON)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	var version int
+	if err = db.QueryRow("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&version); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if version != CurrentLedgerSchemaVersion {
+		db.Close()
+		return nil, fmt.Errorf("ledger schema version %d, expected %d; run ingest with a compatible version", version, CurrentLedgerSchemaVersion)
+	}
+	return &Ledger{db: db, path: dbPath}, nil
+}
+
 // Close closes the database handle.
 func (l *Ledger) Close() error {
 	l.mu.Lock()
@@ -100,7 +119,12 @@ func (l *Ledger) Size() int64 {
 
 // migrate initializes schema tables idempotently across version upgrades.
 func (l *Ledger) migrate() error {
-	if _, err := l.db.Exec(`
+	tx, err := l.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version INTEGER PRIMARY KEY,
 			applied_at DATETIME NOT NULL
@@ -110,7 +134,12 @@ func (l *Ledger) migrate() error {
 	}
 
 	var maxVersion int
-	_ = l.db.QueryRow("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&maxVersion)
+	if err := tx.QueryRow("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&maxVersion); err != nil {
+		return err
+	}
+	if maxVersion > CurrentLedgerSchemaVersion {
+		return fmt.Errorf("unsupported ledger schema version %d", maxVersion)
+	}
 
 	if maxVersion < 1 {
 		v1Schema := `
@@ -160,17 +189,17 @@ func (l *Ledger) migrate() error {
 			error_message TEXT NOT NULL DEFAULT ''
 		);
 		`
-		if _, err := l.db.Exec(v1Schema); err != nil {
+		if _, err := tx.Exec(v1Schema); err != nil {
 			return fmt.Errorf("apply v1 schema: %w", err)
 		}
-		if _, err := l.db.Exec("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)", time.Now().UTC()); err != nil {
+		if _, err := tx.Exec("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)", time.Now().UTC()); err != nil {
 			return fmt.Errorf("record v1 migration: %w", err)
 		}
 	}
 
 	if maxVersion < 2 {
 		cols := make(map[string]bool)
-		rows, err := l.db.Query("PRAGMA table_info(ingest_manifests)")
+		rows, err := tx.Query("PRAGMA table_info(ingest_manifests)")
 		if err != nil {
 			return fmt.Errorf("inspect ingest_manifests schema: %w", err)
 		}
@@ -179,35 +208,41 @@ func (l *Ledger) migrate() error {
 			var name, ctype string
 			var notnull, pk int
 			var dfltValue sql.NullString
-			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err == nil {
-				cols[name] = true
+			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+				rows.Close()
+				return err
 			}
+			cols[name] = true
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
 		}
 		rows.Close()
 
 		if !cols["last_scan_at"] {
-			if _, err := l.db.Exec("ALTER TABLE ingest_manifests ADD COLUMN last_scan_at DATETIME"); err != nil {
+			if _, err := tx.Exec("ALTER TABLE ingest_manifests ADD COLUMN last_scan_at DATETIME"); err != nil {
 				return fmt.Errorf("add last_scan_at: %w", err)
 			}
 		}
 		if !cols["last_scan_status"] {
-			if _, err := l.db.Exec("ALTER TABLE ingest_manifests ADD COLUMN last_scan_status TEXT NOT NULL DEFAULT 'completed'"); err != nil {
+			if _, err := tx.Exec("ALTER TABLE ingest_manifests ADD COLUMN last_scan_status TEXT NOT NULL DEFAULT 'completed'"); err != nil {
 				return fmt.Errorf("add last_scan_status: %w", err)
 			}
 		}
 		if !cols["last_scan_error"] {
-			if _, err := l.db.Exec("ALTER TABLE ingest_manifests ADD COLUMN last_scan_error TEXT NOT NULL DEFAULT ''"); err != nil {
+			if _, err := tx.Exec("ALTER TABLE ingest_manifests ADD COLUMN last_scan_error TEXT NOT NULL DEFAULT ''"); err != nil {
 				return fmt.Errorf("add last_scan_error: %w", err)
 			}
 		}
 		if !cols["source_sha256"] {
-			if _, err := l.db.Exec("ALTER TABLE ingest_manifests ADD COLUMN source_sha256 TEXT"); err != nil {
+			if _, err := tx.Exec("ALTER TABLE ingest_manifests ADD COLUMN source_sha256 TEXT"); err != nil {
 				return fmt.Errorf("add source_sha256: %w", err)
 			}
 		}
 
 		// Backfill last_scan fields for existing manifests where last_scan_at is NULL
-		if _, err := l.db.Exec(`
+		if _, err := tx.Exec(`
 			UPDATE ingest_manifests
 			SET last_scan_at = ingested_at,
 			    last_scan_status = status,
@@ -241,16 +276,16 @@ func (l *Ledger) migrate() error {
 			synced_at DATETIME NOT NULL
 		);
 		`
-		if _, err := l.db.Exec(v2Tables); err != nil {
+		if _, err := tx.Exec(v2Tables); err != nil {
 			return fmt.Errorf("apply v2 tables: %w", err)
 		}
 
-		if _, err := l.db.Exec("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?)", time.Now().UTC()); err != nil {
+		if _, err := tx.Exec("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?)", time.Now().UTC()); err != nil {
 			return fmt.Errorf("record v2 migration: %w", err)
 		}
 	}
 
-	return nil
+	return tx.Commit()
 }
 
 // GetManifests returns all stored ingest manifests keyed by conversation_id.
@@ -665,6 +700,11 @@ type StatusReport struct {
 func (l *Ledger) GetStatus(discoveredCount int) (*StatusReport, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
+	tx, err := l.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
 
 	rep := &StatusReport{
 		LedgerPath:              l.path,
@@ -672,7 +712,7 @@ func (l *Ledger) GetStatus(discoveredCount int) (*StatusReport, error) {
 		DiscoveredConversations: discoveredCount,
 	}
 
-	row := l.db.QueryRow(`
+	row := tx.QueryRow(`
 		SELECT COUNT(*),
 		       COALESCE(SUM(CASE WHEN is_complete = 1 THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN is_complete = 0 AND status = 'active' THEN 1 ELSE 0 END), 0),
@@ -684,9 +724,11 @@ func (l *Ledger) GetStatus(discoveredCount int) (*StatusReport, error) {
 		return nil, fmt.Errorf("scan status counts: %w", err)
 	}
 
-	_ = l.db.QueryRow(`SELECT COUNT(*) FROM conversation_metadata`).Scan(&rep.MetadataCount)
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM conversation_metadata`).Scan(&rep.MetadataCount); err != nil {
+		return nil, err
+	}
 
-	rowGen := l.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(total_tokens), 0) FROM usage_records`)
+	rowGen := tx.QueryRow(`SELECT COUNT(*), COALESCE(SUM(total_tokens), 0) FROM usage_records`)
 	if err := rowGen.Scan(&rep.TotalGenerations, &rep.TotalTokens); err != nil {
 		return nil, fmt.Errorf("scan total generations: %w", err)
 	}
@@ -712,63 +754,82 @@ type VerifyReport struct {
 func (l *Ledger) Verify() (*VerifyReport, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
+	tx, err := l.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
 
 	rep := &VerifyReport{Valid: true, SchemaVersion: CurrentLedgerSchemaVersion}
 
 	// 1. Quick integrity check
 	var integrity string
-	if err := l.db.QueryRow("PRAGMA quick_check;").Scan(&integrity); err != nil || integrity != "ok" {
+	if err := tx.QueryRow("PRAGMA quick_check;").Scan(&integrity); err != nil || integrity != "ok" {
 		rep.Valid = false
 		rep.Errors = append(rep.Errors, fmt.Sprintf("SQLite quick_check failed: %s (err: %v)", integrity, err))
 	}
 
 	// 2. Count records, manifests, metadata
-	_ = l.db.QueryRow("SELECT COUNT(*) FROM usage_records").Scan(&rep.TotalRecords)
-	_ = l.db.QueryRow("SELECT COUNT(*) FROM ingest_manifests").Scan(&rep.TotalManifests)
-	_ = l.db.QueryRow("SELECT COUNT(*) FROM conversation_metadata").Scan(&rep.TotalMetadata)
+	if err := tx.QueryRow("SELECT COUNT(*) FROM usage_records").Scan(&rep.TotalRecords); err != nil {
+		return nil, err
+	}
+	if err := tx.QueryRow("SELECT COUNT(*) FROM ingest_manifests").Scan(&rep.TotalManifests); err != nil {
+		return nil, err
+	}
+	if err := tx.QueryRow("SELECT COUNT(*) FROM conversation_metadata").Scan(&rep.TotalMetadata); err != nil {
+		return nil, err
+	}
 
 	// 3. Invariant check: TotalOutputTokens >= known VisibleOutputTokens + ReasoningTokens
-	rowOut := l.db.QueryRow(`
+	rowOut := tx.QueryRow(`
 		SELECT COUNT(*) FROM usage_records
 		WHERE total_output_tokens < (visible_output_tokens + reasoning_tokens)
 	`)
-	_ = rowOut.Scan(&rep.DiscrepantOutputTokens)
+	if err := rowOut.Scan(&rep.DiscrepantOutputTokens); err != nil {
+		return nil, err
+	}
 	if rep.DiscrepantOutputTokens > 0 {
 		rep.Valid = false
 		rep.Errors = append(rep.Errors, fmt.Sprintf("%d records have total_output_tokens below visible + reasoning", rep.DiscrepantOutputTokens))
 	}
 
 	// 4. Invariant check: TotalTokens == InputTokens + CacheReadTokens + TotalOutputTokens
-	rowTot := l.db.QueryRow(`
+	rowTot := tx.QueryRow(`
 		SELECT COUNT(*) FROM usage_records
 		WHERE total_tokens != (input_tokens + cache_read_tokens + total_output_tokens)
 	`)
-	_ = rowTot.Scan(&rep.DiscrepantTotalTokens)
+	if err := rowTot.Scan(&rep.DiscrepantTotalTokens); err != nil {
+		return nil, err
+	}
 	if rep.DiscrepantTotalTokens > 0 {
 		rep.Valid = false
 		rep.Errors = append(rep.Errors, fmt.Sprintf("%d records have inconsistent total_tokens != input + cache_read + total_output", rep.DiscrepantTotalTokens))
 	}
 
 	// 5. Uniqueness of generation_id
-	rowDup := l.db.QueryRow(`
+	rowDup := tx.QueryRow(`
 		SELECT COUNT(*) FROM (
 			SELECT generation_id FROM usage_records GROUP BY generation_id HAVING COUNT(*) > 1
 		)
 	`)
-	_ = rowDup.Scan(&rep.DuplicateGenerations)
+	if err := rowDup.Scan(&rep.DuplicateGenerations); err != nil {
+		return nil, err
+	}
 	if rep.DuplicateGenerations > 0 {
 		rep.Valid = false
 		rep.Errors = append(rep.Errors, fmt.Sprintf("%d duplicate generation_id records detected", rep.DuplicateGenerations))
 	}
 
 	// 6. Invariant check: manifest generation_count matches usage_records count for completed manifests
-	rowMismatch := l.db.QueryRow(`
+	rowMismatch := tx.QueryRow(`
 		SELECT COUNT(*) FROM ingest_manifests m
 		WHERE m.status = 'completed' AND m.generation_count != (
 			SELECT COUNT(*) FROM usage_records u WHERE u.conversation_id = m.conversation_id
 		)
 	`)
-	_ = rowMismatch.Scan(&rep.MismatchedManifestCount)
+	if err := rowMismatch.Scan(&rep.MismatchedManifestCount); err != nil {
+		return nil, err
+	}
 	if rep.MismatchedManifestCount > 0 {
 		rep.Valid = false
 		rep.Errors = append(rep.Errors, fmt.Sprintf("%d completed manifests have mismatched generation counts against usage records", rep.MismatchedManifestCount))
@@ -801,6 +862,11 @@ type SummaryReport struct {
 func (l *Ledger) GetSummary() (*SummaryReport, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
+	tx, err := l.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
 
 	rep := &SummaryReport{
 		ByModel:   make(map[string]TokenTotals),
@@ -808,10 +874,12 @@ func (l *Ledger) GetSummary() (*SummaryReport, error) {
 	}
 
 	// Distinct conversations
-	_ = l.db.QueryRow("SELECT COUNT(DISTINCT conversation_id) FROM usage_records").Scan(&rep.Conversations)
+	if err := tx.QueryRow("SELECT COUNT(DISTINCT conversation_id) FROM usage_records").Scan(&rep.Conversations); err != nil {
+		return nil, err
+	}
 
 	// Overall totals
-	row := l.db.QueryRow(`
+	row := tx.QueryRow(`
 		SELECT
 			COUNT(*),
 			COALESCE(SUM(input_tokens), 0),
@@ -837,7 +905,7 @@ func (l *Ledger) GetSummary() (*SummaryReport, error) {
 	}
 
 	// Group by model
-	mRows, err := l.db.Query(`
+	mRows, err := tx.Query(`
 		SELECT
 			model,
 			COUNT(*),
@@ -851,22 +919,27 @@ func (l *Ledger) GetSummary() (*SummaryReport, error) {
 		FROM usage_records
 		GROUP BY model
 	`)
-	if err == nil {
-		defer mRows.Close()
-		for mRows.Next() {
-			var m string
-			var t TokenTotals
-			if err := mRows.Scan(
-				&m, &t.GenerationCount, &t.InputTokens, &t.CacheReadTokens, &t.CacheCreationTokens,
-				&t.VisibleOutputTokens, &t.ReasoningTokens, &t.TotalOutputTokens, &t.TotalTokens,
-			); err == nil {
-				rep.ByModel[m] = t
-			}
+	if err != nil {
+		return nil, err
+	}
+	defer mRows.Close()
+	for mRows.Next() {
+		var m string
+		var t TokenTotals
+		if err := mRows.Scan(
+			&m, &t.GenerationCount, &t.InputTokens, &t.CacheReadTokens, &t.CacheCreationTokens,
+			&t.VisibleOutputTokens, &t.ReasoningTokens, &t.TotalOutputTokens, &t.TotalTokens,
+		); err != nil {
+			return nil, err
 		}
+		rep.ByModel[m] = t
+	}
+	if err := mRows.Err(); err != nil {
+		return nil, err
 	}
 
 	// Group by project
-	pRows, err := l.db.Query(`
+	pRows, err := tx.Query(`
 		SELECT
 			project_id,
 			COUNT(*),
@@ -880,18 +953,23 @@ func (l *Ledger) GetSummary() (*SummaryReport, error) {
 		FROM usage_records
 		GROUP BY project_id
 	`)
-	if err == nil {
-		defer pRows.Close()
-		for pRows.Next() {
-			var p string
-			var t TokenTotals
-			if err := pRows.Scan(
-				&p, &t.GenerationCount, &t.InputTokens, &t.CacheReadTokens, &t.CacheCreationTokens,
-				&t.VisibleOutputTokens, &t.ReasoningTokens, &t.TotalOutputTokens, &t.TotalTokens,
-			); err == nil {
-				rep.ByProject[p] = t
-			}
+	if err != nil {
+		return nil, err
+	}
+	defer pRows.Close()
+	for pRows.Next() {
+		var p string
+		var t TokenTotals
+		if err := pRows.Scan(
+			&p, &t.GenerationCount, &t.InputTokens, &t.CacheReadTokens, &t.CacheCreationTokens,
+			&t.VisibleOutputTokens, &t.ReasoningTokens, &t.TotalOutputTokens, &t.TotalTokens,
+		); err != nil {
+			return nil, err
 		}
+		rep.ByProject[p] = t
+	}
+	if err := pRows.Err(); err != nil {
+		return nil, err
 	}
 
 	return rep, nil

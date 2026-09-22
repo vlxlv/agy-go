@@ -46,8 +46,7 @@ func (r *Reader) ReadCatalog() (map[string]*ConversationMeta, error) {
 		FROM conversation_summaries
 	`)
 	if err != nil {
-		// If table does not exist or schema differs, return empty gracefully
-		return result, nil
+		return nil, fmt.Errorf("query conversation catalog: %w", err)
 	}
 	defer rows.Close()
 
@@ -58,7 +57,7 @@ func (r *Reader) ReadCatalog() (map[string]*ConversationMeta, error) {
 			stepCount                         int64
 		)
 		if err := rows.Scan(&cid, &title, &wsUris, &projID, &agent, &lastModStr, &stepCount); err != nil {
-			continue
+			return nil, err
 		}
 
 		cleanURI := ""
@@ -86,7 +85,7 @@ func (r *Reader) ReadCatalog() (map[string]*ConversationMeta, error) {
 		}
 	}
 
-	return result, nil
+	return result, rows.Err()
 }
 
 // ConversationReadResult holds the extracted records and source metadata for a single database.

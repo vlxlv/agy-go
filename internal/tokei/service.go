@@ -121,7 +121,9 @@ func (s *Service) Ingest() (*IngestStats, error) {
 			return nil, fmt.Errorf("get catalog sync state: %w", err)
 		}
 
-		catalogUnchanged := !s.opts.Force && catalogSync != nil &&
+		wal, walErr := os.Stat(summariesPath + "-wal")
+		noWAL := os.IsNotExist(walErr) || (walErr == nil && wal.Size() == 0)
+		catalogUnchanged := noWAL && !s.opts.Force && catalogSync != nil &&
 			catalogSync.CatalogPath == summariesPath &&
 			catalogSync.CatalogSize == fiSum.Size() &&
 			catalogSync.CatalogMtimeNs == fiSum.ModTime().UnixNano()
@@ -142,7 +144,13 @@ func (s *Service) Ingest() (*IngestStats, error) {
 			}
 		}
 	} else {
-		catalog, _ = ledger.GetAllConversationMetadata()
+		if err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+		catalog, err = ledger.GetAllConversationMetadata()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	reader := NewReader(summariesPath)
@@ -230,12 +238,12 @@ func (s *Service) Ingest() (*IngestStats, error) {
 // Status returns a high-level status of the ledger and discovery state.
 func (s *Service) Status() (*StatusReport, error) {
 	dbs, err := s.Discover()
-	discoveredCount := 0
-	if err == nil {
-		discoveredCount = len(dbs)
+	if err != nil {
+		return nil, err
 	}
+	discoveredCount := len(dbs)
 
-	ledger, err := OpenLedger(s.opts.LedgerPath)
+	ledger, err := OpenLedgerReadOnly(s.opts.LedgerPath)
 	if err != nil {
 		return nil, err
 	}
@@ -246,7 +254,7 @@ func (s *Service) Status() (*StatusReport, error) {
 
 // Verify runs validation checks across the usage ledger.
 func (s *Service) Verify() (*VerifyReport, error) {
-	ledger, err := OpenLedger(s.opts.LedgerPath)
+	ledger, err := OpenLedgerReadOnly(s.opts.LedgerPath)
 	if err != nil {
 		return nil, err
 	}
@@ -257,7 +265,7 @@ func (s *Service) Verify() (*VerifyReport, error) {
 
 // Summary returns aggregated token totals across the dataset.
 func (s *Service) Summary() (*SummaryReport, error) {
-	ledger, err := OpenLedger(s.opts.LedgerPath)
+	ledger, err := OpenLedgerReadOnly(s.opts.LedgerPath)
 	if err != nil {
 		return nil, err
 	}
