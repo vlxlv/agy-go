@@ -4,13 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"github.com/vlxlv/agy-go/internal/inventory"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/vlxlv/agy-go/internal/inventory"
 )
 
 func TestCLISafeDefaults(t *testing.T) {
-	for _, args := range [][]string{{}, {"--help"}, {"prune"}, {"delete"}, {"gc"}, {"cleanup"}, {"scan"}, {"inspect", "--source-dir", "/home/ezhang/.gemini", "secret.db"}, {"scan", "--secret-credential"}} {
+	for _, args := range [][]string{{}, {"--help"}, {"prune"}, {"delete"}, {"gc"}, {"cleanup"}, {"restore"}, {"scan"}, {"verify-archive"}, {"inspect", "--source-dir", "/home/ezhang/.gemini", "secret.db"}, {"scan", "--secret-credential"}} {
 		var out, errs bytes.Buffer
 		code := run(context.Background(), args, &out, &errs)
 		if len(args) > 0 && args[0] != "--help" && code == 0 {
@@ -24,6 +26,32 @@ func TestCLISafeDefaults(t *testing.T) {
 		if strings.Contains(out.String()+errs.String(), "secret") {
 			t.Fatal("private argument echoed")
 		}
+	}
+}
+
+func TestArchiveVerificationAndRegistryRendering(t *testing.T) {
+	verified := time.Unix(100, 0).UTC()
+	result := inventory.ArchiveVerificationResult{FormatVersion: 1, State: inventory.ArchiveValid, ArchiveID: "0123456789abcdef0123456789abcdef", ConversationID: "conversation", PathRef: "path-sha256:abc", ManifestSHA256: "def", Files: 2, Bytes: 10, VerifiedAt: verified}
+	var out bytes.Buffer
+	if err := renderArchiveVerification(&out, result, true); err != nil {
+		t.Fatal(err)
+	}
+	var decoded inventory.ArchiveVerificationResult
+	if json.Unmarshal(out.Bytes(), &decoded) != nil || decoded.State != inventory.ArchiveValid || decoded.Files != 2 {
+		t.Fatal("verification JSON contract")
+	}
+	out.Reset()
+	if err := renderArchiveVerification(&out, result, false); err != nil || !strings.Contains(out.String(), "valid") || strings.Contains(out.String(), "path-sha256") {
+		t.Fatal("verification text contract")
+	}
+	report := inventory.ArchiveRegistryReport{FormatVersion: 1, RegistryRef: "path-sha256:registry", Archives: []inventory.ArchiveRegistryEntry{{ArchiveID: result.ArchiveID, ConversationID: result.ConversationID, PathRef: result.PathRef, CreatedAt: verified, VerificationState: inventory.ArchiveValid, VerifiedAt: &verified, Files: 2, Bytes: 10}}}
+	out.Reset()
+	if err := renderArchiveRegistry(&out, report, true); err != nil || !strings.Contains(out.String(), "registry_ref") {
+		t.Fatal("registry JSON contract")
+	}
+	out.Reset()
+	if err := renderArchiveRegistry(&out, report, false); err != nil || !strings.Contains(out.String(), "VERIFICATION") || !strings.Contains(out.String(), "valid") {
+		t.Fatal("registry text contract")
 	}
 }
 

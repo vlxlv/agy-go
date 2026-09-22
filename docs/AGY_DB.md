@@ -1,4 +1,4 @@
-# agy-db — CP1/CP2 complete; CP3 BLOCKED
+# agy-db — V1 complete; V2 archive/verification CP2; deletion CP3 BLOCKED
 
 **agy-db never modifies AGY conversation database contents.**
 
@@ -6,12 +6,14 @@
 
 ## Purpose
 
-Independent binary within agy-go for read-only AGY conversation database inventory
-and retention planning: structural inspection, lifecycle evidence reporting,
-retention decision analysis, and blocker explanation.
+Independent binary within agy-go for AGY conversation inventory, structural
+inspection, lifecycle evidence reporting, retention analysis, storage auditing
+and external archival. Source handling remains read-only.
 CP1 provides read-only inventory; CP2 adds a pure retention decision engine and
-dry-run reporting. There is no deletion, ledger write, conversation editing,
-database repair or background process.
+dry-run reporting. V2-CP1 adds creation of a detached, verified archive;
+V2-CP2 adds offline verification and an agy-db-owned registry. There is no
+restore, deletion, ledger write, conversation editing, database repair or
+background process.
 The current target is Linux, including Debian WSL; run it inside WSL.
 
 ## Scope
@@ -23,6 +25,9 @@ go build ./cmd/agy-db
 ./agy-db inspect --source-dir /explicit/development/fixtures example.db
 ./agy-db plan --source-dir /explicit/development/fixtures --retention 720h
 ./agy-db plan --source-dir /explicit/development/fixtures --ledger /explicit/development/usage.db --retention 720h --json
+./agy-db archive --source-dir /explicit/conversations --brain-dir /explicit/brain --summaries-db /explicit/conversation_summaries.db --id conversation-id --output /explicit/archives/conversation-id
+./agy-db verify-archive --registry /explicit/agy-db/registry.db /explicit/archives/conversation-id
+./agy-db archives --registry /explicit/agy-db/registry.db
 ```
 
 Flags precede the inspect filename. `status` is a fresh scan, not cached state.
@@ -544,12 +549,155 @@ can be reopened/resumed and receive new steps remains unresolved by an
 authoritative contract. **IDLE != FINALIZED.** Inactivity cannot be converted
 into automatic deletion eligibility.
 
+## V2 archive model (CP1)
+
+AGY owns resume, rename, delete and import semantics. agy-db owns external
+archive, verification and storage-audit semantics. V2-CP1 adds only:
+
+```text
+agy-db archive --source-dir DIR --id ID --output DIR \
+  [--brain-dir DIR] [--summaries-db FILE] [--json]
+```
+
+The source bundle is bounded by explicitly configured roots and may contain
+`conversations/<id>.db`, its WAL/SHM coordination files, `brain/<id>/`, and one
+matching row in `conversation_summaries.db`. Missing optional brain or summary
+artifacts are recorded as absent. Arbitrary source trees, symlinks, path
+escapes, multiply linked regular files, special files and an existing output
+path are rejected.
+
+### Consistent detached snapshot
+
+agy-db opens the live main DB and optional WAL with `O_NOFOLLOW` for byte reads;
+it never gives the live path or file descriptor to SQLite. It hashes and stats
+main DB, WAL and SHM before capture, copies main DB plus any WAL into a private
+0700 staging directory, then repeats every observation. Any appearance,
+disappearance, replacement, byte change, size change, mode change or mtime
+change fails closed as `blocked_source_changed`.
+
+Only after those observations match does the existing modernc SQLite Online
+Backup API open the private captured DB/WAL pair and normalize committed WAL
+state into `conversation/main.db`. The detached result must pass
+`integrity_check`, exact recognized schema checks and sidecar-absence checks.
+The live source is never checkpointed, SQLite-opened, written or locked by
+agy-db. A continuously changing source is blocked rather than retried forever.
+Raw `cp main.db` is not the snapshot mechanism.
+
+SHM is transient SQLite coordination state: it is observed for mutation but is
+not copied into the archive. WAL is captured only in private staging and is not
+published. The archive contains one closed, self-contained SQLite snapshot.
+
+### Archive format and manifest
+
+Format version 1 is a directory:
+
+```text
+archive/
+  manifest.json
+  conversation/main.db
+  brain/...                 # optional
+  summary/metadata.json     # optional catalog-row payload
+```
+
+`manifest.json` contains `format_version`, a random `archive_id`, UTC
+`created_at`, `conversation_id`, recognized source schema/version, observed WAL
+state, source-main and detached-snapshot SHA-256 values, source size, optional
+artifact presence, tool version, and a sorted `archive_files` array. Every file
+entry has a local relative path, byte size, SHA-256 and role. The manifest never
+contains prompts, responses, credentials, tokens, raw protobufs or host source
+paths. Conversation content remains inside the archived payload files as
+expected. Normal text and JSON command output contains IDs, state and hashes
+only.
+
+The summary database receives the same private main/WAL capture and mutation
+checks. agy-db exports at most the exact matching catalog row as archive payload;
+it does not update or forge AGY catalog state. A later restore checkpoint must
+either use an authoritative AGY registration/import contract or leave this row
+as handoff metadata.
+
+### Atomic publication and crash safety
+
+agy-db builds under a private sibling directory with 0700 directory and 0600
+file permissions. It hashes every payload, parses the manifest, rejects
+unlisted/symlink/special files, reopens the detached DB read-only, and verifies
+all declared sizes and hashes. Linux `renameat2(RENAME_NOREPLACE)` publishes the
+verified directory atomically and refuses overwrite. Ordinary failures remove
+staging best-effort. A process or host crash may leave a hidden staging
+directory, but never a partial archive at the requested final path.
+
+## V2 offline verification (CP2)
+
+```text
+agy-db verify-archive [--registry FILE] [--json] ARCHIVE
+```
+
+The public command uses the same `verifyArchiveDirectory` implementation used
+before atomic archive publication. It pins the archive root by directory file
+descriptor and performs no archive writes. It validates the manifest version,
+archive/conversation IDs, canonical local paths, duplicate paths, sizes,
+SHA-256 values, declared roles, required detached DB, optional brain and summary
+payloads, absence of DB sidecars, exact recognized SQLite schema and SQLite
+integrity. Symlinks, multiply linked files, special files and normalization or
+path-escape attempts fail closed. The DB is opened through a pinned descriptor
+with `mode=ro`, `immutable=1`, `query_only=ON` and `trusted_schema=OFF`.
+
+Verification returns exactly one typed state:
+
+- `valid`: every gate passed; exit 0.
+- `corrupt`: malformed metadata, hash/size mismatch, invalid SQLite, or invalid
+  payload; exit 1.
+- `incomplete`: a required artifact is absent or the closed DB depends on a
+  WAL/SHM/journal sidecar; exit 1.
+- `unsupported`: archive format or SQLite schema is unknown; exit 1.
+- `unsafe`: archive root, path or file safety cannot be established; exit 1.
+
+Invalid CLI arguments use exit 2. Text and JSON output contain typed state,
+IDs, counts, hashes and a fixed reason code; they do not contain archive paths
+or conversation payloads.
+
+## V2 archive registry (CP2)
+
+The registry is a dedicated agy-db SQLite database. `--registry FILE` selects
+it. Without that flag, the default is
+`$XDG_STATE_HOME/agy-db/registry.db`, or
+`~/.local/state/agy-db/registry.db` when XDG_STATE_HOME is unset. This database
+is agy-db state and is never stored in an AGY conversation source or archive.
+
+Schema version 1 uses `PRAGMA user_version=1`, an agy-db application ID and two
+tables: `archives` and `archive_files`. It records archive/conversation IDs,
+the internal archive location, creation and verification times, manifest and
+source snapshot identities, typed verification status, and per-file path,
+role, size and hash. It stores no prompt, response, credential, token or raw
+protobuf content. Registry files use 0600 permissions; their parent directory
+uses 0700 where created. Unknown, malformed or differently versioned schemas
+fail closed rather than being implicitly migrated.
+
+A successful `archive` is immediately verified and registered. Public
+`verify-archive` updates the matching status and can register a valid archive
+that was created elsewhere. An archive-ID collision is accepted only when the
+immutable manifest/source identity agrees. Registry updates are transactional;
+concurrent verification is supported by SQLite WAL and a bounded busy timeout.
+
+```text
+agy-db archives [--registry FILE] [--id ARCHIVE_ID] [--json]
+```
+
+The command lists registry status, verification time, file/byte totals and a
+hashed path reference. `--id` selects one exact archive. It does not scan,
+modify or delete archives. The registry may have its own SQLite WAL/SHM files;
+those belong to agy-db and are unrelated to AGY source WAL state.
+
+V2-CP2 does not implement restore; that remains a later reviewed checkpoint.
+Archive existence or registry status does not authorize source deletion, and
+the CP3 deletion blocker remains unchanged.
+
 ## Explicit non-goals
 
 No prune/delete/unlink of source databases; conversation edits or repair;
 source/ledger migrations or writes; AGY execution; production/VPS operations;
 background garbage collection; usage analytics replacement for agy-tokei;
 agy-pool state management; or changes to agy-pool/agy-tokei behavior.
-The sole production `os.RemoveAll` in inventory cleans up its own freshly
-created private snapshot directory, never the source directory or source file.
-Tests may remove synthetic sidecars inside registered temporary roots.
+Production removal calls are confined to freshly created private snapshot and
+archive-staging paths; none receives a source root, source DB, WAL, SHM, brain
+artifact or summary database path. Tests may remove synthetic sources and
+sidecars inside registered temporary roots.
