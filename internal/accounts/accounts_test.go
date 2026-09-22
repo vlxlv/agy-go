@@ -3,10 +3,14 @@ package accounts
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -134,11 +138,12 @@ func TestFindAccountByTarget(t *testing.T) {
 
 func TestWriteAndSyncAgyTokenFile(t *testing.T) {
 	setupIsolatedTestDir(t)
+	expiry := float64(time.Now().Add(time.Hour).Unix())
 
 	acc := &storage.Account{
-		ID:           "acc_1",
-		Email:        "user@gmail.com",
-		AccessToken:  "at-123",
+		ID:          "acc_1",
+		Email:       "user@gmail.com",
+		AccessToken: "at-123", TokenExpiry: &expiry,
 		RefreshToken: "rf-456",
 		IDToken:      "id-tok-789",
 	}
@@ -380,10 +385,11 @@ func TestRemoveAccount_ReplacementSyncFailureKeepsPool(t *testing.T) {
 
 func TestRemoveAccount(t *testing.T) {
 	setupIsolatedTestDir(t)
+	expiry := float64(time.Now().Add(time.Hour).Unix())
 
 	pool := storage.NewEmptyPool()
-	acc1 := &storage.Account{ID: "acc_1", Email: "1@gmail.com", AccessToken: "token-acc-1"}
-	acc2 := &storage.Account{ID: "acc_2", Email: "2@gmail.com", AccessToken: "token-acc-2"}
+	acc1 := &storage.Account{ID: "acc_1", Email: "1@gmail.com", AccessToken: "token-acc-1", TokenExpiry: &expiry}
+	acc2 := &storage.Account{ID: "acc_2", Email: "2@gmail.com", AccessToken: "token-acc-2", TokenExpiry: &expiry}
 	pool.Accounts = []*storage.Account{acc1, acc2}
 	pool.ActiveAccountID = &acc1.ID
 	if err := storage.SavePool(pool); err != nil {
@@ -413,6 +419,7 @@ func TestRemoveAccount(t *testing.T) {
 
 func TestSwitchAccount(t *testing.T) {
 	setupIsolatedTestDir(t)
+	expiry := float64(time.Now().Add(time.Hour).Unix())
 
 	frac1 := 0.2
 	frac2 := 0.8
@@ -420,14 +427,14 @@ func TestSwitchAccount(t *testing.T) {
 	acc1 := &storage.Account{
 		ID:          "acc_1",
 		Email:       "1@gmail.com",
-		AccessToken: "token-acc-1",
-		LastQuota:   &storage.QuotaState{RemainingFraction: &frac1},
+		AccessToken: "token-acc-1", TokenExpiry: &expiry,
+		LastQuota: &storage.QuotaState{RemainingFraction: &frac1},
 	}
 	acc2 := &storage.Account{
 		ID:          "acc_2",
 		Email:       "2@gmail.com",
-		AccessToken: "token-acc-2",
-		LastQuota:   &storage.QuotaState{RemainingFraction: &frac2},
+		AccessToken: "token-acc-2", TokenExpiry: &expiry,
+		LastQuota: &storage.QuotaState{RemainingFraction: &frac2},
 	}
 	pool.Accounts = []*storage.Account{acc1, acc2}
 	pool.ActiveAccountID = &acc1.ID
@@ -834,13 +841,14 @@ func TestSymlinkToProductionRejected(t *testing.T) {
 
 func TestRemoveAccountRepairsActiveAndRRCursor(t *testing.T) {
 	setupIsolatedTestDir(t)
+	expiry := float64(time.Now().Add(time.Hour).Unix())
 
 	// 1. Setup 3 accounts: acc_1, acc_2, acc_3
 	p := storage.NewEmptyPool()
 	p.Accounts = []*storage.Account{
-		{ID: "acc_1", Email: "first@example.com", AccessToken: "token-acc-1"},
-		{ID: "acc_2", Email: "second@example.com", AccessToken: "token-acc-2"},
-		{ID: "acc_3", Email: "third@example.com", AccessToken: "token-acc-3"},
+		{ID: "acc_1", Email: "first@example.com", AccessToken: "token-acc-1", TokenExpiry: &expiry},
+		{ID: "acc_2", Email: "second@example.com", AccessToken: "token-acc-2", TokenExpiry: &expiry},
+		{ID: "acc_3", Email: "third@example.com", AccessToken: "token-acc-3", TokenExpiry: &expiry},
 	}
 	p.ActiveAccountID = &p.Accounts[0].ID
 	p.RoundRobinLastAccountID = &p.Accounts[1].ID
@@ -1099,5 +1107,106 @@ func TestVerifyDoesNotOverwriteConcurrentCredentials(t *testing.T) {
 	}
 	if got.Accounts[0].RefreshToken != "new-refresh" || got.Accounts[0].Status != "auth_error" {
 		t.Fatal("stale probe overwrote newer state")
+	}
+}
+
+func TestLoginCallbackStateAndPKCE(t *testing.T) {
+	setupIsolatedTestDir(t)
+	challenges := make(chan string, 1)
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Error(err)
+		}
+		verifier := r.FormValue("code_verifier")
+		sum := sha256.Sum256([]byte(verifier))
+		if len(verifier) < 43 || base64.RawURLEncoding.EncodeToString(sum[:]) != <-challenges || r.FormValue("code") != "good" {
+			t.Error("invalid PKCE verifier or callback code")
+			w.WriteHeader(400)
+			return
+		}
+		io.WriteString(w, `{"access_token":"access","refresh_token":"refresh","expires_in":3600,"id_token":"eyJhbGciOiJub25lIn0.eyJlbWFpbCI6InRlc3RAZXhhbXBsZS5jb20ifQ."}`)
+	}))
+	defer tokenServer.Close()
+	_, err := Login(context.Background(), LoginOptions{
+		TokenEndpoint: tokenServer.URL, Timeout: 3 * time.Second, PortRange: [2]int{0, 0},
+		BrowserOpener: func(authURL string) error {
+			u, err := url.Parse(authURL)
+			if err != nil {
+				return err
+			}
+			q := u.Query()
+			challenges <- q.Get("code_challenge")
+			if q.Get("code_challenge_method") != "S256" || q.Get("state") == "" {
+				t.Error("missing state/PKCE")
+			}
+			callback := q.Get("redirect_uri")
+			for _, state := range []string{"", "wrong", q.Get("state")} {
+				code := "bad"
+				if state == q.Get("state") {
+					code = "good"
+				}
+				resp, err := http.Get(callback + "?code=" + code + "&state=" + url.QueryEscape(state))
+				if err != nil {
+					return err
+				}
+				resp.Body.Close()
+				want := 400
+				if code == "good" {
+					want = 200
+				}
+				if resp.StatusCode != want {
+					t.Errorf("callback status=%d want=%d", resp.StatusCode, want)
+				}
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnknownExpiryRequiresRefresh(t *testing.T) {
+	setupIsolatedTestDir(t)
+	old := tokenRefresher
+	defer func() { tokenRefresher = old }()
+	calls := 0
+	tokenRefresher = func(*storage.Account) (string, error) { calls++; return "", errors.New("refresh unavailable") }
+	account := &storage.Account{ID: "a", AccessToken: "unknown-age"}
+	pool := storage.NewEmptyPool()
+	pool.Accounts = []*storage.Account{account}
+	pool.ActiveAccountID = &account.ID
+	if err := storage.SavePool(pool); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncAccountToAgy(account); err == nil {
+		t.Fatal("unknown expiry bypassed refresh")
+	}
+	if synced, err := SyncActiveAgyTokenFile(); err == nil || synced {
+		t.Fatal("sync accepted unknown expiry")
+	}
+	if calls != 2 {
+		t.Fatalf("refresh calls=%d", calls)
+	}
+	if _, err := os.Stat(config.GetAgyTokenFile()); !os.IsNotExist(err) {
+		t.Fatalf("wrote unverified token: %v", err)
+	}
+}
+
+func TestImportRejectsUnknownIdentity(t *testing.T) {
+	setupIsolatedTestDir(t)
+	path := config.GetAgyTokenFile()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"token":{"refresh_token":"unknown"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ImportCurrent(); err == nil {
+		t.Fatal("imported fabricated identity")
+	}
+	pool, err := storage.LoadPool()
+	if err != nil || len(pool.Accounts) != 0 {
+		t.Fatalf("import modified pool: %+v %v", pool, err)
 	}
 }

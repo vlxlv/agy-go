@@ -473,7 +473,7 @@ func TestLogin_BrowserOpenerSucceeds_HTTPCallbackSucceeds(t *testing.T) {
 		}
 		redirectURI := u.Query().Get("redirect_uri")
 		time.Sleep(20 * time.Millisecond)
-		resp, err := http.Get(redirectURI + "?code=browser-code-123")
+		resp, err := http.Get(redirectURI + "?code=browser-code-123&state=" + url.QueryEscape(u.Query().Get("state")))
 		if err == nil {
 			_ = resp.Body.Close()
 		}
@@ -579,15 +579,19 @@ func TestLogin_BrowserOpenerFails_PastedCallbackURLSucceeds(t *testing.T) {
 	server := setupMockOAuthTokenServer(t, "pasted-url-code-789", "pasted_user@gmail.com", "at-pasted-789", "rt-pasted-789")
 	defer server.Close()
 
+	stdin := strings.NewReader("")
 	origOpener := LoginOpener
 	LoginOpener = func(targetURL string) error {
+		u, err := url.Parse(targetURL)
+		if err != nil {
+			return err
+		}
+		stdin.Reset(u.Query().Get("redirect_uri") + "?code=pasted-url-code-789&state=" + url.QueryEscape(u.Query().Get("state")) + "\n")
 		return errors.New("headless: no browser installed")
 	}
 	defer func() { LoginOpener = origOpener }()
 
 	var stdout, stderr bytes.Buffer
-	pastedURL := "http://localhost:8085/auth/callback?code=pasted-url-code-789&scope=email\n"
-	stdin := strings.NewReader(pastedURL)
 
 	code := LoginCmdWithOptions(stdin, &stdout, &stderr, accounts.LoginOptions{
 		TokenEndpoint: server.URL,
@@ -669,7 +673,7 @@ func TestLogin_OAuthCallbackError(t *testing.T) {
 		}
 		redirectURI := u.Query().Get("redirect_uri")
 		time.Sleep(20 * time.Millisecond)
-		resp, err := http.Get(redirectURI + "?error=access_denied")
+		resp, err := http.Get(redirectURI + "?error=access_denied&state=" + url.QueryEscape(u.Query().Get("state")))
 		if err == nil {
 			_ = resp.Body.Close()
 		}

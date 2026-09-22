@@ -2,6 +2,9 @@ package accounts
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -187,7 +190,7 @@ func writeAgyTokenFile(account *storage.Account) error {
 	if err := os.MkdirAll(filepath.Dir(tokenFile), 0o700); err != nil {
 		return fmt.Errorf("failed to create agy-cli directory: %w", err)
 	}
-	expiryTS := time.Now().Unix() + 3600
+	expiryTS := int64(0)
 	if account.TokenExpiry != nil && *account.TokenExpiry > 0 {
 		expiryTS = int64(*account.TokenExpiry)
 	}
@@ -246,7 +249,7 @@ func SyncActiveAgyTokenFile() (bool, error) {
 			}
 
 			// Refresh only when credentials are absent or near expiry; never write after failure.
-			if account.AccessToken == "" || (account.TokenExpiry != nil && *account.TokenExpiry-float64(time.Now().Unix()) <= 120) {
+			if account.AccessToken == "" || (account.TokenExpiry == nil || *account.TokenExpiry-float64(time.Now().Unix()) <= 120) {
 				if _, err := tokenRefresher(account); err != nil {
 					return fmt.Errorf("failed to refresh active account %s: %w", account.ID, err)
 				}
@@ -275,7 +278,7 @@ func syncAccountToAgy(account *storage.Account) error {
 	if account == nil {
 		return errors.New("nil account")
 	}
-	if account.AccessToken == "" || (account.TokenExpiry != nil && *account.TokenExpiry-float64(time.Now().Unix()) <= 120) {
+	if account.AccessToken == "" || (account.TokenExpiry == nil || *account.TokenExpiry-float64(time.Now().Unix()) <= 120) {
 		if _, err := tokenRefresher(account); err != nil {
 			return fmt.Errorf("failed to refresh account %s: %w", account.ID, err)
 		}
@@ -513,7 +516,7 @@ func ImportCurrent() (*storage.Account, error) {
 	claims := auth.DecodeJWTPayload(raw.IDToken)
 	email, _ := claims["email"].(string)
 	if email == "" {
-		email = "primary_user@gmail.com"
+		return nil, errors.New("cannot import token without an account email; log in to identify the account")
 	}
 
 	now := time.Now().Unix()
@@ -575,16 +578,15 @@ type LoginOptions struct {
 	Stdout        io.Writer
 }
 
-func findFreePort(start, end int) (int, error) {
+func listenCallback(start, end int) (net.Listener, error) {
 	for p := start; p <= end; p++ {
 		addr := fmt.Sprintf("127.0.0.1:%d", p)
 		l, err := net.Listen("tcp", addr)
 		if err == nil {
-			_ = l.Close()
-			return p, nil
+			return l, nil
 		}
 	}
-	return 0, fmt.Errorf("no free port available in range %d-%d", start, end)
+	return nil, fmt.Errorf("no free port available in range %d-%d", start, end)
 }
 
 // DefaultBrowserOpener attempts to open the target URL in the system default browser.
@@ -642,19 +644,28 @@ func Login(ctx context.Context, opts LoginOptions) (*storage.Account, error) {
 		timeout = 180 * time.Second
 	}
 
-	port, err := findFreePort(startPort, endPort)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	listener, err := listenCallback(startPort, endPort)
 	if err != nil {
 		return nil, err
 	}
 
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+	state, verifier := rand.Text(), rand.Text()+rand.Text()
+	challenge := sha256.Sum256([]byte(verifier))
 	redirectURI := fmt.Sprintf("http://localhost:%d/auth/callback", port)
 	params := url.Values{
-		"client_id":     {auth.GetClientID()},
-		"redirect_uri":  {redirectURI},
-		"response_type": {"code"},
-		"scope":         {auth.OAuthScopes},
-		"access_type":   {"offline"},
-		"prompt":        {"consent"},
+		"client_id":             {auth.GetClientID()},
+		"redirect_uri":          {redirectURI},
+		"response_type":         {"code"},
+		"state":                 {state},
+		"code_challenge":        {base64.RawURLEncoding.EncodeToString(challenge[:])},
+		"code_challenge_method": {"S256"},
+		"scope":                 {auth.OAuthScopes},
+		"access_type":           {"offline"},
+		"prompt":                {"consent"},
 	}
 	authURL := authEndpoint + "?" + params.Encode()
 
@@ -664,10 +675,14 @@ func Login(ctx context.Context, opts LoginOptions) (*storage.Account, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/auth/callback", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
+		if r.Method != http.MethodGet || q.Get("state") != state {
+			http.Error(w, "Invalid OAuth callback state", http.StatusBadRequest)
+			return
+		}
 		if code := q.Get("code"); code != "" {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, `<html><body style="font-family:sans-serif;text-align:center;padding:40px;background:#0f172a;color:#f8fafc;"><h2>Authorization Successful!</h2><p>Antigravity multi-account token has been saved.</p></body></html>`)
+			_, _ = io.WriteString(w, `<html><body style="font-family:sans-serif;text-align:center;padding:40px;background:#0f172a;color:#f8fafc;"><h2>Authorization Successful!</h2><p>Authorization code received. Check the terminal for the login result.</p></body></html>`)
 			select {
 			case codeChan <- code:
 			default:
@@ -688,13 +703,9 @@ func Login(ctx context.Context, opts LoginOptions) (*storage.Account, error) {
 	})
 
 	server := &http.Server{
-		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
-		Handler: mux,
-	}
-
-	listener, err := net.Listen("tcp", server.Addr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to listen on %s: %w", server.Addr, err)
+		Addr:              fmt.Sprintf("127.0.0.1:%d", port),
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {
@@ -734,6 +745,13 @@ func Login(ctx context.Context, opts LoginOptions) (*storage.Account, error) {
 			val = strings.TrimSpace(val)
 			if strings.Contains(val, "code=") {
 				if parsed, err := url.Parse(val); err == nil {
+					if parsed.Query().Get("state") != state {
+						select {
+						case errChan <- errors.New("OAuth callback state mismatch"):
+						default:
+						}
+						return
+					}
 					val = parsed.Query().Get("code")
 				}
 			}
@@ -749,9 +767,7 @@ func Login(ctx context.Context, opts LoginOptions) (*storage.Account, error) {
 	var code string
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(timeout):
-		return nil, errors.New("login timed out or cancelled")
+		return nil, fmt.Errorf("login timed out or cancelled: %w", ctx.Err())
 	case cErr := <-errChan:
 		return nil, cErr
 	case c := <-codeChan:
@@ -765,9 +781,15 @@ func Login(ctx context.Context, opts LoginOptions) (*storage.Account, error) {
 		"client_secret": {auth.GetClientSecret()},
 		"redirect_uri":  {redirectURI},
 		"grant_type":    {"authorization_code"},
+		"code_verifier": {verifier},
 	}
 
-	resp, err := auth.HTTPClient.PostForm(tokenEndpoint, tokenForm)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint, strings.NewReader(tokenForm.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := auth.HTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("OAuth token exchange failed: %w", err)
 	}

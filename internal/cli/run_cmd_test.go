@@ -531,6 +531,7 @@ func TestRunAgyWithLB_ValidSyncExecutesAgy(t *testing.T) {
 		Name:        "Main",
 		Email:       "user@example.com",
 		AccessToken: "valid-access-token",
+		TokenExpiry: func() *float64 { v := float64(time.Now().Add(time.Hour).Unix()); return &v }(),
 	}
 	pool.Accounts = []*storage.Account{acc}
 	pool.ActiveAccountID = &acc.ID
@@ -582,6 +583,7 @@ func TestRunAgyWithLB_SyncFailureAborts(t *testing.T) {
 		Name:        "Main",
 		Email:       secretEmail,
 		AccessToken: secretToken,
+		TokenExpiry: func() *float64 { v := float64(time.Now().Add(time.Hour).Unix()); return &v }(),
 	}
 	pool.Accounts = []*storage.Account{acc}
 	pool.ActiveAccountID = &acc.ID

@@ -157,6 +157,7 @@ func TestNativeTokenSync_TestModeSyntheticSucceeds(t *testing.T) {
 	acc := &storage.Account{
 		ID:          "acc_1",
 		AccessToken: "synced-token",
+		TokenExpiry: func() *float64 { v := float64(time.Now().Add(time.Hour).Unix()); return &v }(),
 	}
 	pool := storage.NewEmptyPool()
 	pool.Accounts = []*storage.Account{acc}
