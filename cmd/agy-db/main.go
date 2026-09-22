@@ -22,11 +22,11 @@ func main() {
 
 func run(ctx context.Context, args []string, out, errOut io.Writer) int {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "help" {
-		fmt.Fprintln(out, "agy-db scan|status --source-dir DIR [--json]\nagy-db inspect --source-dir DIR [--json] NAME.db\nagy-db plan --source-dir DIR [--ledger FILE] [--retention 720h] [--json]\nagy-db archive --source-dir DIR --id ID --output DIR [--brain-dir DIR] [--summaries-db FILE] [--registry FILE] [--json]\nagy-db verify-archive [--registry FILE] [--json] ARCHIVE\nagy-db archives [--registry FILE] [--id ARCHIVE_ID] [--json]\nagy-db is read-only against AGY sources and archives: it never modifies or deletes conversation databases or archive payloads.\nArchive creates a verified detached snapshot and never checkpoints the live database. Plan is always dry-run; CP3 BLOCKED.")
+		fmt.Fprintln(out, "agy-db scan|status --source-dir DIR [--json]\nagy-db inspect --source-dir DIR [--json] NAME.db\nagy-db plan --source-dir DIR [--ledger FILE] [--retention 720h] [--json]\nagy-db archive --source-dir DIR --id ID --output DIR [--brain-dir DIR] [--summaries-db FILE] [--registry FILE] [--json]\nagy-db verify-archive [--registry FILE] [--json] ARCHIVE\nagy-db archives [--registry FILE] [--id ARCHIVE_ID] [--json]\nagy-db restore --conversation-dir DIR --brain-dir DIR [--registry FILE] [--json] ARCHIVE\nagy-db is read-only against existing AGY sources and archives: it never modifies or deletes conversation databases or archive payloads. Restore creates new files only and never writes conversation_summaries.db.\nArchive creates a verified detached snapshot and never checkpoints the live database. Plan is always dry-run; deletion CP3 BLOCKED.")
 		return 0
 	}
 	cmd := args[0]
-	if cmd != "scan" && cmd != "status" && cmd != "inspect" && cmd != "plan" && cmd != "archive" && cmd != "verify-archive" && cmd != "archives" {
+	if cmd != "scan" && cmd != "status" && cmd != "inspect" && cmd != "plan" && cmd != "archive" && cmd != "verify-archive" && cmd != "archives" && cmd != "restore" {
 		fmt.Fprintln(errOut, "unknown command")
 		return 2
 	}
@@ -38,7 +38,7 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) int {
 		fs.StringVar(&root, "source-dir", "", "Explicit source directory")
 	}
 	asJSON := fs.Bool("json", false, "JSON output")
-	var ledger, retentionText, conversationID, output, brainDir, summariesDB, registryPath, archiveID string
+	var ledger, retentionText, conversationID, output, brainDir, summariesDB, registryPath, archiveID, conversationDir string
 	if cmd == "plan" {
 		fs.StringVar(&ledger, "ledger", "", "Explicit usage ledger file")
 		fs.StringVar(&retentionText, "retention", "", "Positive whole-second duration, e.g. 720h; no default")
@@ -49,17 +49,21 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) int {
 		fs.StringVar(&brainDir, "brain-dir", "", "Bounded brain root")
 		fs.StringVar(&summariesDB, "summaries-db", "", "Conversation summaries database")
 	}
-	if cmd == "archive" || cmd == "verify-archive" || cmd == "archives" {
+	if cmd == "archive" || cmd == "verify-archive" || cmd == "archives" || cmd == "restore" {
 		fs.StringVar(&registryPath, "registry", "", "agy-db archive registry")
 	}
 	if cmd == "archives" {
 		fs.StringVar(&archiveID, "id", "", "Exact archive ID")
 	}
-	if fs.Parse(args[1:]) != nil || ((cmd == "scan" || cmd == "status" || cmd == "inspect" || cmd == "plan" || cmd == "archive") && root == "") || (cmd == "inspect" && fs.NArg() != 1) || (cmd == "verify-archive" && fs.NArg() != 1) || (cmd != "inspect" && cmd != "verify-archive" && fs.NArg() != 0) || (cmd == "archive" && (conversationID == "" || output == "")) {
+	if cmd == "restore" {
+		fs.StringVar(&conversationDir, "conversation-dir", "", "New conversation database destination root")
+		fs.StringVar(&brainDir, "brain-dir", "", "New brain artifact destination root")
+	}
+	if fs.Parse(args[1:]) != nil || ((cmd == "scan" || cmd == "status" || cmd == "inspect" || cmd == "plan" || cmd == "archive") && root == "") || (cmd == "inspect" && fs.NArg() != 1) || ((cmd == "verify-archive" || cmd == "restore") && fs.NArg() != 1) || (cmd != "inspect" && cmd != "verify-archive" && cmd != "restore" && fs.NArg() != 0) || (cmd == "archive" && (conversationID == "" || output == "")) || (cmd == "restore" && (conversationDir == "" || brainDir == "")) {
 		fmt.Fprintln(errOut, "invalid arguments; see agy-db --help")
 		return 2
 	}
-	if cmd == "archive" || cmd == "verify-archive" || cmd == "archives" {
+	if cmd == "archive" || cmd == "verify-archive" || cmd == "archives" || cmd == "restore" {
 		if registryPath == "" {
 			var err error
 			registryPath, err = inventory.DefaultArchiveRegistryPath()
@@ -109,6 +113,23 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) int {
 		report, err := registry.List(ctx, archiveID)
 		if err != nil || renderArchiveRegistry(out, report, *asJSON) != nil {
 			fmt.Fprintln(errOut, "registry query failed")
+			return 1
+		}
+		return 0
+	}
+	if cmd == "restore" {
+		registry, err := inventory.OpenArchiveRegistry(registryPath)
+		if err != nil {
+			fmt.Fprintln(errOut, "registry unavailable")
+			return 1
+		}
+		result, restoreErr := inventory.Restore(ctx, inventory.RestoreOptions{ArchivePath: fs.Arg(0), ConversationDir: conversationDir, BrainDir: brainDir, Registry: registry})
+		closeErr := registry.Close()
+		if renderRestore(out, result, *asJSON) != nil {
+			return 1
+		}
+		if restoreErr != nil || closeErr != nil {
+			fmt.Fprintln(errOut, result.Reason)
 			return 1
 		}
 		return 0
@@ -230,6 +251,14 @@ func renderArchiveRegistry(out io.Writer, report inventory.ArchiveRegistryReport
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%.24s\n", entry.ArchiveID, entry.ConversationID, entry.CreatedAt.UTC().Format(time.RFC3339Nano), entry.VerificationState, verified, entry.Files, entry.Bytes, entry.PathRef)
 	}
 	return w.Flush()
+}
+
+func renderRestore(out io.Writer, result inventory.RestoreResult, asJSON bool) error {
+	if asJSON {
+		return json.NewEncoder(out).Encode(result)
+	}
+	_, err := fmt.Fprintf(out, "STATUS\tARCHIVE ID\tCONVERSATION ID\tPUBLISHED\tCATALOG REGISTRATION\tREASON\n%s\t%s\t%s\t%v\trequired\t%s\n", result.Status, result.ArchiveID, result.ConversationID, result.Published, result.Reason)
+	return err
 }
 
 func renderPlan(out io.Writer, r inventory.PlanReport, asJSON bool) error {

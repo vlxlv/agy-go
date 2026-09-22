@@ -571,21 +571,13 @@ func archiveBrain(ctx context.Context, rootPath, id, staging string) (bool, []Ar
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return false, nil, errors.New("brain_source_unsafe")
 	}
-	observed, dirs, err := observeBrain(root, id)
+	observed, _, err := observeBrain(root, id)
 	if err != nil {
 		return false, nil, err
 	}
 	destination := filepath.Join(staging, "brain")
 	if err := os.Mkdir(destination, 0700); err != nil {
 		return false, nil, errors.New("archive_stage_failed")
-	}
-	for _, dir := range dirs {
-		if dir == "" {
-			continue
-		}
-		if err := os.MkdirAll(filepath.Join(destination, filepath.FromSlash(dir)), 0700); err != nil {
-			return false, nil, errors.New("archive_stage_failed")
-		}
 	}
 	files := make([]ArchiveFile, 0, len(observed))
 	for _, source := range observed {
@@ -597,6 +589,10 @@ func archiveBrain(ctx context.Context, rootPath, id, staging string) (bool, []Ar
 			return false, nil, errSourceChanged
 		}
 		dst := filepath.Join(destination, filepath.FromSlash(source.rel))
+		if err := os.MkdirAll(filepath.Dir(dst), 0700); err != nil {
+			in.Close()
+			return false, nil, errors.New("archive_stage_failed")
+		}
 		out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		if err != nil {
 			in.Close()

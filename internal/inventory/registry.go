@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const ArchiveRegistryVersion = 1
+const ArchiveRegistryVersion = 2
 
 type ArchiveRegistry struct {
 	db      *sql.DB
@@ -144,9 +144,43 @@ CREATE TABLE archive_files (
   role TEXT NOT NULL,
   PRIMARY KEY (archive_id,path)
 );
-PRAGMA user_version=1;
+CREATE TABLE restore_events (
+  event_id TEXT PRIMARY KEY,
+  archive_id TEXT,
+  conversation_id TEXT,
+  restored_at TEXT NOT NULL,
+  result TEXT NOT NULL,
+  destination_ref TEXT NOT NULL,
+  db_published INTEGER NOT NULL,
+  brain_published INTEGER NOT NULL,
+  catalog_registered INTEGER NOT NULL,
+  tool_version TEXT NOT NULL
+);
+PRAGMA user_version=2;
 PRAGMA application_id=1095190852;`); err != nil || tx.Commit() != nil {
 			return errors.New("registry initialization failed")
+		}
+		version = ArchiveRegistryVersion
+	}
+	if version == 1 && archiveRegistryV1SchemaMatches(db) {
+		tx, err := db.Begin()
+		if err != nil {
+			return errors.New("registry migration failed")
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(`CREATE TABLE restore_events (
+  event_id TEXT PRIMARY KEY,
+  archive_id TEXT,
+  conversation_id TEXT,
+  restored_at TEXT NOT NULL,
+  result TEXT NOT NULL,
+  destination_ref TEXT NOT NULL,
+  db_published INTEGER NOT NULL,
+  brain_published INTEGER NOT NULL,
+  catalog_registered INTEGER NOT NULL,
+  tool_version TEXT NOT NULL
+); PRAGMA user_version=2;`); err != nil || tx.Commit() != nil {
+			return errors.New("registry migration failed")
 		}
 		version = ArchiveRegistryVersion
 	}
@@ -178,14 +212,42 @@ func archiveRegistrySchemaMatches(db *sql.DB) bool {
 		}
 		got = append(got, name)
 	}
-	if rows.Err() != nil || !slices.Equal(got, []string{"archive_files", "archives"}) {
+	if rows.Err() != nil || !slices.Equal(got, []string{"archive_files", "archives", "restore_events"}) {
 		return false
 	}
 	expected := map[string][]string{
-		"archives":      {"archive_id:TEXT:1", "conversation_id:TEXT:0", "archive_path:TEXT:0", "format_version:INTEGER:0", "created_at:TEXT:0", "source_main_sha256:TEXT:0", "source_snapshot_sha256:TEXT:0", "manifest_sha256:TEXT:0", "verification_state:TEXT:0", "verified_at:TEXT:0", "registered_at:TEXT:0"},
-		"archive_files": {"archive_id:TEXT:1", "path:TEXT:2", "size:INTEGER:0", "sha256:TEXT:0", "role:TEXT:0"},
+		"archives":       {"archive_id:TEXT:1", "conversation_id:TEXT:0", "archive_path:TEXT:0", "format_version:INTEGER:0", "created_at:TEXT:0", "source_main_sha256:TEXT:0", "source_snapshot_sha256:TEXT:0", "manifest_sha256:TEXT:0", "verification_state:TEXT:0", "verified_at:TEXT:0", "registered_at:TEXT:0"},
+		"archive_files":  {"archive_id:TEXT:1", "path:TEXT:2", "size:INTEGER:0", "sha256:TEXT:0", "role:TEXT:0"},
+		"restore_events": {"event_id:TEXT:1", "archive_id:TEXT:0", "conversation_id:TEXT:0", "restored_at:TEXT:0", "result:TEXT:0", "destination_ref:TEXT:0", "db_published:INTEGER:0", "brain_published:INTEGER:0", "catalog_registered:INTEGER:0", "tool_version:TEXT:0"},
 	}
 	return archiveSchemaMatches(context.Background(), db, expected)
+}
+
+func archiveRegistryV1SchemaMatches(db *sql.DB) bool {
+	var applicationID int
+	if db.QueryRow("PRAGMA application_id").Scan(&applicationID) != nil || applicationID != 1095190852 {
+		return false
+	}
+	rows, err := db.Query("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	got := []string{}
+	for rows.Next() {
+		var name string
+		if rows.Scan(&name) != nil {
+			return false
+		}
+		got = append(got, name)
+	}
+	if rows.Err() != nil || !slices.Equal(got, []string{"archive_files", "archives"}) {
+		return false
+	}
+	return archiveSchemaMatches(context.Background(), db, map[string][]string{
+		"archives":      {"archive_id:TEXT:1", "conversation_id:TEXT:0", "archive_path:TEXT:0", "format_version:INTEGER:0", "created_at:TEXT:0", "source_main_sha256:TEXT:0", "source_snapshot_sha256:TEXT:0", "manifest_sha256:TEXT:0", "verification_state:TEXT:0", "verified_at:TEXT:0", "registered_at:TEXT:0"},
+		"archive_files": {"archive_id:TEXT:1", "path:TEXT:2", "size:INTEGER:0", "sha256:TEXT:0", "role:TEXT:0"},
+	})
 }
 
 func (r *ArchiveRegistry) Close() error {
@@ -212,6 +274,33 @@ func (r *ArchiveRegistry) RecordVerification(ctx context.Context, archivePath st
 		return errors.New("registry update failed")
 	}
 	return nil
+}
+
+func (r *ArchiveRegistry) RecordRestoreEvent(ctx context.Context, result RestoreResult) error {
+	if !validRestoreStatus(result.Status) || result.RestoredAt.IsZero() {
+		return errors.New("invalid restore event")
+	}
+	eventID, err := randomID()
+	if err != nil {
+		return errors.New("registry restore event failed")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.New("registry restore event failed")
+	}
+	defer tx.Rollback()
+	destinationRef := result.DBDestinationRef + "|" + result.BrainDestinationRef
+	_, err = tx.ExecContext(ctx, `INSERT INTO restore_events
+(event_id,archive_id,conversation_id,restored_at,result,destination_ref,db_published,brain_published,catalog_registered,tool_version)
+VALUES(?,?,?,?,?,?,?,?,?,?)`, eventID, result.ArchiveID, result.ConversationID, result.RestoredAt.Format(time.RFC3339Nano), result.Status, destinationRef, slices.Contains(result.Published, "conversation_db"), slices.Contains(result.Published, "brain"), false, "agy-db-v2-cp3")
+	if err != nil || tx.Commit() != nil {
+		return errors.New("registry restore event failed")
+	}
+	return nil
+}
+
+func validRestoreStatus(status RestoreStatus) bool {
+	return status == RestoreRestored || status == RestoreConflict || status == RestoreInvalidArchive || status == RestoreUnsafeDestination || status == RestoreStagingFailed || status == RestoreVerificationFailed || status == RestorePartialPublish || status == RestoreRegistryFailed
 }
 
 func (r *ArchiveRegistry) registerValid(ctx context.Context, archivePath string, result ArchiveVerificationResult) error {

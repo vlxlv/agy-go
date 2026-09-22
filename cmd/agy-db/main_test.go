@@ -55,6 +55,27 @@ func TestArchiveVerificationAndRegistryRendering(t *testing.T) {
 	}
 }
 
+func TestRestoreRenderingPrivacy(t *testing.T) {
+	result := inventory.RestoreResult{FormatVersion: 1, ArchiveID: "0123456789abcdef0123456789abcdef", ConversationID: "conversation", Status: inventory.RestoreRestored, Published: []string{"conversation_db", "brain"}, DBDestinationRef: "path-sha256:abc", BrainDestinationRef: "path-sha256:def", CatalogRegistrationRequired: true, RestoredAt: time.Unix(100, 0).UTC()}
+	var out bytes.Buffer
+	if err := renderRestore(&out, result, true); err != nil {
+		t.Fatal(err)
+	}
+	var decoded inventory.RestoreResult
+	if json.Unmarshal(out.Bytes(), &decoded) != nil || decoded.Status != inventory.RestoreRestored || !decoded.CatalogRegistrationRequired {
+		t.Fatal("restore JSON contract")
+	}
+	for _, private := range []string{"private prompt", "/home/user", "conversation_summaries.db"} {
+		if strings.Contains(out.String(), private) {
+			t.Fatal("private restore output")
+		}
+	}
+	out.Reset()
+	if err := renderRestore(&out, result, false); err != nil || !strings.Contains(out.String(), "restored") || !strings.Contains(out.String(), "required") || strings.Contains(out.String(), "path-sha256") {
+		t.Fatal("restore text contract")
+	}
+}
+
 func TestPlanRenderingAndArguments(t *testing.T) {
 	r := inventory.PlanReport{FormatVersion: 1, DryRun: true, Sources: []inventory.Decision{{SourceID: "sha256:abc", PathRef: "path-sha256:def", Blockers: []inventory.Blocker{inventory.BlockedIncompleteIngestEvidence}}}, EvidenceGaps: []string{"generation_bound_complete_ingest_contract_missing"}}
 	var out bytes.Buffer

@@ -1,8 +1,11 @@
-# agy-db — V1 complete; V2 archive/verification CP2; deletion CP3 BLOCKED
+# agy-db — V1 complete; V2 archive/verification/restore CP3; deletion BLOCKED
 
 **agy-db never modifies AGY conversation database contents.**
 
-**agy-db v1 never deletes AGY conversation databases. CP3 is BLOCKED.**
+**agy-db never deletes AGY conversation databases. Deletion CP3 is BLOCKED.**
+
+**Restore never modifies an existing conversation and never writes
+conversation_summaries.db.**
 
 ## Purpose
 
@@ -12,8 +15,8 @@ and external archival. Source handling remains read-only.
 CP1 provides read-only inventory; CP2 adds a pure retention decision engine and
 dry-run reporting. V2-CP1 adds creation of a detached, verified archive;
 V2-CP2 adds offline verification and an agy-db-owned registry. There is no
-restore, deletion, ledger write, conversation editing, database repair or
-background process.
+V2-CP3 adds non-overwriting whole-bundle restore. There is no deletion, ledger
+write, conversation editing, database repair or background process.
 The current target is Linux, including Debian WSL; run it inside WSL.
 
 ## Scope
@@ -28,6 +31,7 @@ go build ./cmd/agy-db
 ./agy-db archive --source-dir /explicit/conversations --brain-dir /explicit/brain --summaries-db /explicit/conversation_summaries.db --id conversation-id --output /explicit/archives/conversation-id
 ./agy-db verify-archive --registry /explicit/agy-db/registry.db /explicit/archives/conversation-id
 ./agy-db archives --registry /explicit/agy-db/registry.db
+./agy-db restore --conversation-dir /explicit/target/conversations --brain-dir /explicit/target/brain --registry /explicit/agy-db/registry.db /explicit/archives/conversation-id
 ```
 
 Flags precede the inspect filename. `status` is a fresh scan, not cached state.
@@ -663,8 +667,10 @@ it. Without that flag, the default is
 `~/.local/state/agy-db/registry.db` when XDG_STATE_HOME is unset. This database
 is agy-db state and is never stored in an AGY conversation source or archive.
 
-Schema version 1 uses `PRAGMA user_version=1`, an agy-db application ID and two
-tables: `archives` and `archive_files`. It records archive/conversation IDs,
+Schema version 2 uses `PRAGMA user_version=2`, an agy-db application ID and
+three tables: `archives`, `archive_files`, and `restore_events`. Existing valid
+version-1 registries are transactionally migrated by adding only
+`restore_events`; unknown shapes still fail closed. The registry records archive/conversation IDs,
 the internal archive location, creation and verification times, manifest and
 source snapshot identities, typed verification status, and per-file path,
 role, size and hash. It stores no prompt, response, credential, token or raw
@@ -687,9 +693,77 @@ hashed path reference. `--id` selects one exact archive. It does not scan,
 modify or delete archives. The registry may have its own SQLite WAL/SHM files;
 those belong to agy-db and are unrelated to AGY source WAL state.
 
-V2-CP2 does not implement restore; that remains a later reviewed checkpoint.
-Archive existence or registry status does not authorize source deletion, and
-the CP3 deletion blocker remains unchanged.
+## V2 restore model (CP3)
+
+```text
+agy-db restore \
+  --conversation-dir DIR \
+  --brain-dir DIR \
+  [--registry FILE] [--json] ARCHIVE
+```
+
+Restore begins by running the public archive verifier against the archive
+itself. Registry status is never accepted as a substitute. A valid archive is
+opened again through a pinned directory descriptor and verified before bytes
+are staged, protecting against archive replacement between verification and
+copying.
+
+The detached DB is staged in a private `.agy-db-restore-*` directory inside the
+configured conversation root. Brain files, when present, are independently
+staged inside the configured brain root. Staging stays on each target
+filesystem so publication can use `renameat2(RENAME_NOREPLACE)`. Directories are
+0700 and restored regular files are normalized to 0600. Symlinks, hardlinks,
+special files, path escapes, unsafe roots, archive/destination overlap, root
+replacement and undeclared files fail closed. Empty brain directories are not
+semantic archive entries and are omitted; declared brain files and their parent
+directories are restored.
+
+Before publication, the staged DB must match the manifest size and SHA-256,
+pass integrity and exact-schema checks, and have no WAL, SHM or journal
+dependency. Every staged brain file is rehashed against the manifest. After
+publication, the DB and brain tree are verified again through pinned destination
+roots. Restore never publishes DB sidecars.
+
+The destination layout is:
+
+```text
+conversations/<conversation-id>.db
+brain/<conversation-id>/...       # only when present in the archive
+```
+
+All DB, sidecar and brain targets are preflighted as absent. Existing targets
+produce `conflict`; matching hashes do not convert conflict into success. There
+is no `--force` or overwrite mode. Concurrent restores of one conversation are
+resolved by `RENAME_NOREPLACE`, so exactly one can publish the DB.
+
+DB and brain cannot be atomically published as one operation. agy-db publishes
+the DB first and brain second. If brain publication or post-publication
+verification fails, status is `partial_publish`; already-published valid files
+remain in place, published roles are returned, and deterministic recovery
+guidance is included. agy-db never deletes a published artifact as rollback.
+A crash may leave a hidden staging directory, or may leave a published DB before
+brain publication; it cannot create a valid-looking overwrite.
+
+Restore statuses are `restored`, `conflict`, `invalid_archive`,
+`unsafe_destination`, `staging_failed`, `verification_failed`,
+`partial_publish`, and `registry_failed`. Successful publication followed by a
+registry write failure returns `registry_failed` with the underlying file
+status and exact published roles; restored files remain untouched.
+
+Registry version 2 records each completed restore attempt in `restore_events`:
+event/archive/conversation IDs, UTC time, typed result, privacy-safe destination
+reference, DB/brain publication booleans, `catalog_registered=false`, and tool
+version. Writes are transactional and contain no conversation content.
+
+Summary metadata remains archive payload only. Restore reports
+`summary_metadata_present` and `catalog_registration_required=true`, but never
+creates, opens for writing, or updates `conversation_summaries.db`. AGY owns
+resume, rename, delete, import and catalog lifecycle. A restored file bundle may
+therefore require an official AGY import/registration step before AGY discovers
+it automatically; agy-db does not imitate that behavior.
+
+Archive existence, successful restore, or registry status does not authorize
+source deletion. The deletion blocker remains unchanged.
 
 ## Explicit non-goals
 
@@ -698,6 +772,7 @@ source/ledger migrations or writes; AGY execution; production/VPS operations;
 background garbage collection; usage analytics replacement for agy-tokei;
 agy-pool state management; or changes to agy-pool/agy-tokei behavior.
 Production removal calls are confined to freshly created private snapshot and
-archive-staging paths; none receives a source root, source DB, WAL, SHM, brain
-artifact or summary database path. Tests may remove synthetic sources and
-sidecars inside registered temporary roots.
+archive/restore-staging paths; none receives a source root, existing source DB,
+published conversation DB, published brain artifact, WAL, SHM, or summary
+database path. Tests may remove synthetic sources and sidecars inside registered
+temporary roots.

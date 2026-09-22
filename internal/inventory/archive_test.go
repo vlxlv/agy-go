@@ -286,6 +286,28 @@ func TestArchiveOptionalArtifactsAndVerifier(t *testing.T) {
 	}
 }
 
+func TestArchiveOmitsUndeclaredEmptyBrainDirectories(t *testing.T) {
+	inv, sourceRoot, _ := setup(t)
+	fixture(t, sourceRoot, "empty-brain.db", fixtureSchema)
+	base := t.TempDir()
+	registerTestRoot(t, base)
+	brainRoot := filepath.Join(base, "brain-root")
+	if err := os.MkdirAll(filepath.Join(brainRoot, "empty-brain", "empty", "nested"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(base, "archive")
+	if _, err := inv.Archive(context.Background(), ArchiveOptions{ConversationID: "empty-brain", BrainDir: brainRoot, Output: output}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := verifyArchiveDirectory(context.Background(), output)
+	if err != nil || !manifest.BrainPresent || len(manifest.ArchiveFiles) != 1 {
+		t.Fatalf("manifest: %+v %v", manifest, err)
+	}
+	if _, err := os.Stat(filepath.Join(output, "brain", "empty")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("undeclared empty directory archived")
+	}
+}
+
 func TestSimultaneousArchivePublishesOnce(t *testing.T) {
 	inv, _, opt := archiveFixture(t, false, false)
 	var wg sync.WaitGroup
