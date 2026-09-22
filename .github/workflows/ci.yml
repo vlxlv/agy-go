@@ -119,7 +119,7 @@ jobs:
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
         with:
-          name: agy-pool-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          name: agy-tools-${{ matrix.target.os }}-${{ matrix.target.arch }}
           path: |
             dist/agy-pool-${{ matrix.target.os }}-${{ matrix.target.arch }}
             dist/agy-pool-${{ matrix.target.os }}-${{ matrix.target.arch }}.sha256
@@ -138,7 +138,7 @@ jobs:
       - name: Download all build artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: agy-pool-*
+          pattern: agy-tools-*
           path: dist
           merge-multiple: true
 
