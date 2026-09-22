@@ -40,6 +40,16 @@ func TestCrypto_DecryptPythonVector(t *testing.T) {
 	}
 }
 
+func TestCrypto_RejectsExcessivePBKDF2Work(t *testing.T) {
+	bundle := &EncryptedBundle{
+		Format:     "agy-pool-encrypted-v1",
+		Iterations: maxPBKDF2Iterations + 1,
+	}
+	if _, err := DecryptBundle(bundle, "password"); err == nil {
+		t.Fatal("expected excessive PBKDF2 iterations to be rejected")
+	}
+}
+
 func TestCrypto_CrossLanguageRoundtrip(t *testing.T) {
 	plaintext := []byte("cross-language-verification-42-secret-payload")
 	password := "super-secure-passphrase"

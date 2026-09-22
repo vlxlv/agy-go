@@ -397,6 +397,26 @@ func TestTop_IntervalBounds(t *testing.T) {
 	}
 }
 
+func TestTop_RejectsInvalidArguments(t *testing.T) {
+	tmpDir, cleanup := setupCLITestEnv(t)
+	defer cleanup()
+
+	for _, args := range [][]string{
+		{"top", "--interval", "--once", "-D", tmpDir},
+		{"top", "--interval=bad", "--once", "-D", tmpDir},
+		{"top", "--unknown", "--once", "-D", tmpDir},
+		{"top", "first", "second", "--once", "-D", tmpDir},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := Main(args, nil, &stdout, &stderr); code == 0 {
+			t.Fatalf("%v unexpectedly succeeded", args)
+		}
+		if stderr.Len() == 0 {
+			t.Fatalf("%v returned no error message", args)
+		}
+	}
+}
+
 func TestTop_KeyHandling_Q_Plus_Minus_R(t *testing.T) {
 	tmpDir, cleanup := setupCLITestEnv(t)
 	defer cleanup()

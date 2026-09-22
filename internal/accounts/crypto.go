@@ -31,6 +31,8 @@ type EncryptedBundle struct {
 	Tag        string `json:"tag"`
 }
 
+const maxPBKDF2Iterations = 1_000_000
+
 // EncryptBundle encrypts plaintext using PBKDF2-HMAC-SHA256 and HMAC-CTR stream cipher matching Python agy-pool.
 func EncryptBundle(plaintext []byte, password string, salt, nonce []byte) (*EncryptedBundle, error) {
 	if len(salt) == 0 {
@@ -117,6 +119,9 @@ func DecryptBundle(bundle *EncryptedBundle, password string) ([]byte, error) {
 	iterations := bundle.Iterations
 	if iterations <= 0 {
 		iterations = 100000
+	}
+	if iterations > maxPBKDF2Iterations {
+		return nil, fmt.Errorf("encrypted bundle PBKDF2 iterations exceed limit %d", maxPBKDF2Iterations)
 	}
 
 	dk := pbkdf2.Key([]byte(password), salt, iterations, 64, sha256.New)

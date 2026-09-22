@@ -66,33 +66,39 @@ func TopCmd(stdin io.Reader, stdout, stderr io.Writer, args ...string) int {
 	for i := 0; i < len(rem); i++ {
 		a := rem[i]
 		if a == "-i" || a == "--interval" {
-			if i+1 < len(rem) {
-				if d, err := time.ParseDuration(rem[i+1]); err == nil {
-					interval = d
-					i++
-					continue
-				} else if secs, err := strconv.ParseFloat(rem[i+1], 64); err == nil {
-					interval = time.Duration(secs * float64(time.Second))
-					i++
-					continue
-				}
+			if i+1 >= len(rem) {
+				fmt.Fprintln(stderr, "[Error] --interval requires a value")
+				return 1
 			}
+			d, err := parseTopInterval(rem[i+1])
+			if err != nil {
+				fmt.Fprintf(stderr, "[Error] %v\n", err)
+				return 1
+			}
+			interval = d
+			i++
+			continue
 		} else if strings.HasPrefix(a, "--interval=") {
-			val := strings.TrimPrefix(a, "--interval=")
-			if d, err := time.ParseDuration(val); err == nil {
-				interval = d
-				continue
-			} else if secs, err := strconv.ParseFloat(val, 64); err == nil {
-				interval = time.Duration(secs * float64(time.Second))
-				continue
+			d, err := parseTopInterval(strings.TrimPrefix(a, "--interval="))
+			if err != nil {
+				fmt.Fprintf(stderr, "[Error] %v\n", err)
+				return 1
 			}
+			interval = d
+			continue
 		} else if a == "-w" || a == "--watch" {
 			// Transparently accepted from quota -w or status -w
 			continue
 		} else if a == "--once" {
 			once = true
 			continue
-		} else if !strings.HasPrefix(a, "-") && targetAccount == "" {
+		} else if strings.HasPrefix(a, "-") {
+			fmt.Fprintf(stderr, "[Error] unknown top option %q\n", a)
+			return 1
+		} else if targetAccount != "" {
+			fmt.Fprintf(stderr, "[Error] unexpected argument %q\n", a)
+			return 1
+		} else {
 			targetAccount = a
 		}
 	}
@@ -123,6 +129,17 @@ func TopCmd(stdin io.Reader, stdout, stderr io.Writer, args ...string) int {
 	}
 
 	return RunTop(ctx, opts)
+}
+
+func parseTopInterval(value string) (time.Duration, error) {
+	if d, err := time.ParseDuration(value); err == nil {
+		return d, nil
+	}
+	seconds, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		return 0, fmt.Errorf("invalid top interval %q", value)
+	}
+	return time.Duration(seconds * float64(time.Second)), nil
 }
 
 // RunTop executes the dashboard loop or single-frame render.

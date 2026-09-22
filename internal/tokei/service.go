@@ -36,7 +36,8 @@ type IngestStats struct {
 	FailedCount     int           `json:"failed_count"`
 	TotalRecords    int64         `json:"total_records"`
 	NewRecords      int64         `json:"new_records"`
-	Duration        time.Duration `json:"duration_ms"`
+	Duration        time.Duration `json:"-"`
+	DurationMS      int64         `json:"duration_ms"`
 }
 
 // Service coordinates discovery, ingestion, ledger management, and reporting.
@@ -214,11 +215,18 @@ func (s *Service) Ingest() (*IngestStats, error) {
 
 		if err := ledger.CommitIngest(manifest, readRes.Records); err != nil {
 			stats.FailedCount++
+			_ = ledger.RecordScanFailure(cid, dbPath, err)
 			continue
 		}
 
 		stats.IngestedCount++
-		stats.NewRecords += int64(len(readRes.Records))
+		previous := int64(0)
+		if existing := manifests[cid]; existing != nil {
+			previous = existing.GenerationCount
+		}
+		if current := int64(len(readRes.Records)); current > previous {
+			stats.NewRecords += current - previous
+		}
 		if readRes.IsComplete {
 			stats.CompletedCount++
 		} else {
@@ -227,11 +235,16 @@ func (s *Service) Ingest() (*IngestStats, error) {
 	}
 
 	st, err := ledger.GetStatus(len(dbs))
-	if err == nil {
-		stats.TotalRecords = st.TotalGenerations
+	if err != nil {
+		return stats, err
 	}
+	stats.TotalRecords = st.TotalGenerations
 
 	stats.Duration = time.Since(startTime)
+	stats.DurationMS = stats.Duration.Milliseconds()
+	if stats.FailedCount > 0 {
+		return stats, fmt.Errorf("%d conversation database(s) failed to ingest", stats.FailedCount)
+	}
 	return stats, nil
 }
 

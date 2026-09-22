@@ -2,6 +2,7 @@ package tokei
 
 import (
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -119,6 +120,30 @@ func TestCatalogChangeDetection(t *testing.T) {
 	if stats1.IngestedCount != 1 {
 		t.Errorf("expected 1 ingested, got %d", stats1.IngestedCount)
 	}
+	if stats1.NewRecords != 1 {
+		t.Errorf("expected 1 new record, got %d", stats1.NewRecords)
+	}
+
+	svc.opts.Force = true
+	statsRepeat, err := svc.Ingest()
+	if err != nil {
+		t.Fatalf("forced repeat ingest failed: %v", err)
+	}
+	if statsRepeat.NewRecords != 0 {
+		t.Errorf("repeat ingest reported %d new records", statsRepeat.NewRecords)
+	}
+	rawStats, err := json.Marshal(statsRepeat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var statsJSON map[string]any
+	if err := json.Unmarshal(rawStats, &statsJSON); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := statsJSON["duration_ms"].(float64); !ok {
+		t.Fatalf("duration_ms is not a JSON number: %s", rawStats)
+	}
+	svc.opts.Force = false
 
 	ledger, err := OpenLedger(ledgerPath)
 	if err != nil {
@@ -244,8 +269,8 @@ func TestService_MalformedSourceAttempt(t *testing.T) {
 
 	// Ingest attempt on corrupted source
 	stats2, err := svc.Ingest()
-	if err != nil {
-		t.Fatalf("ingest on malformed db failed with error: %v", err)
+	if err == nil {
+		t.Fatal("ingest on malformed db reported success")
 	}
 	if stats2.FailedCount != 1 {
 		t.Errorf("expected 1 failed db count, got %d", stats2.FailedCount)

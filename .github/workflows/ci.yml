@@ -108,10 +108,13 @@ jobs:
           GOARCH: ${{ matrix.target.arch }}
         run: |
           mkdir -p dist
-          BIN="agy-pool-${{ matrix.target.os }}-${{ matrix.target.arch }}"
-          go build -trimpath -ldflags="-s -w" -o "dist/${BIN}" ./cmd/agy-pool
+          POOL_BIN="agy-pool-${{ matrix.target.os }}-${{ matrix.target.arch }}"
+          TOKEI_BIN="agy-tokei-${{ matrix.target.os }}-${{ matrix.target.arch }}"
+          go build -trimpath -ldflags="-s -w" -o "dist/${POOL_BIN}" ./cmd/agy-pool
+          go build -trimpath -ldflags="-s -w" -o "dist/${TOKEI_BIN}" ./cmd/agy-tokei
           cd dist
-          sha256sum "${BIN}" > "${BIN}.sha256"
+          sha256sum "${POOL_BIN}" > "${POOL_BIN}.sha256"
+          sha256sum "${TOKEI_BIN}" > "${TOKEI_BIN}.sha256"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
@@ -120,6 +123,8 @@ jobs:
           path: |
             dist/agy-pool-${{ matrix.target.os }}-${{ matrix.target.arch }}
             dist/agy-pool-${{ matrix.target.os }}-${{ matrix.target.arch }}.sha256
+            dist/agy-tokei-${{ matrix.target.os }}-${{ matrix.target.arch }}
+            dist/agy-tokei-${{ matrix.target.os }}-${{ matrix.target.arch }}.sha256
           retention-days: 7
 
   verify-artifacts:
@@ -140,18 +145,19 @@ jobs:
       - name: Generate unified SHA256SUMS
         run: |
           cd dist
-          sha256sum agy-pool-linux-amd64 agy-pool-linux-arm64 agy-pool-darwin-amd64 agy-pool-darwin-arm64 > SHA256SUMS
+          sha256sum agy-{pool,tokei}-{linux-amd64,linux-arm64,darwin-amd64,darwin-arm64} > SHA256SUMS
           cat SHA256SUMS
 
       - name: Verify native linux-amd64 binary execution
         run: |
-          chmod +x dist/agy-pool-linux-amd64
+          chmod +x dist/agy-pool-linux-amd64 dist/agy-tokei-linux-amd64
 
           echo "=== Testing --version ==="
           dist/agy-pool-linux-amd64 --version
 
           echo "=== Testing --help ==="
           dist/agy-pool-linux-amd64 --help
+          dist/agy-tokei-linux-amd64 help
 
           echo "=== Testing rejection of removed daemon-run ==="
           set +e
