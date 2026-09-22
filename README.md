@@ -41,7 +41,14 @@ cd agy-go
 
 # Build native binary
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/agy-pool ./cmd/agy-pool
+
+# Independent conversation inventory and dry-run planning tool (CP2)
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/agy-db ./cmd/agy-db
 ```
+
+`agy-db` requires an explicit source directory and never modifies conversation
+contents. v1 does not delete source databases; CP3 is blocked by missing
+complete-ingest and activity evidence. See [inventory usage and safety boundaries](docs/AGY_DB.md).
 
 ### Cross-Compilation Matrix
 Zero external C toolchains are required:

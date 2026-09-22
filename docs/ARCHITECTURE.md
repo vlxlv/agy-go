@@ -9,12 +9,11 @@
    - Current implementation originates from the verified `agy-pool-go` baseline.
 
 2. **`agy-tokei`**
-   - Future AGY usage analytics and terminal dashboard.
-   - *Not implemented yet.*
+   - AGY usage ledger and analytics, with text tables and JSON output.
 
 3. **`agy-db`**
-   - Future AGY conversation database inventory and retention tool.
-   - *Not implemented yet.*
+   - Independent binary for read-only inventory and retention dry-run planning (CP2).
+   - Complete-ingest evidence is insufficient; deletion is blocked and not implemented. See [safety contract](AGY_DB.md).
 
 ---
 
