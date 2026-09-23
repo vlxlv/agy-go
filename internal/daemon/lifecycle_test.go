@@ -200,6 +200,41 @@ func TestIsDaemonOutdated(t *testing.T) {
 	}
 }
 
+func TestLifecycle_RequireSameInstanceRejectsForeignProcess(t *testing.T) {
+	tmpDir := t.TempDir()
+	resetSandbox := config.SetSyntheticSandboxRoot(tmpDir)
+	t.Cleanup(resetSandbox)
+	pidFile := filepath.Join(tmpDir, "agy-pool.pid")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan struct{})
+	portCh := make(chan int, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = RunForeground(ctx, ServerOptions{Port: 0, EphemeralPort: true, PIDFile: pidFile, ReadyChan: ready, BoundPortChan: portCh, DisableSignals: true})
+	}()
+	<-ready
+	port := <-portCh
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	if err := WritePIDFile(pidFile, DaemonInfo{PID: os.Getpid(), DataDir: filepath.Join(tmpDir, "foreign"), Port: port, Version: config.Version}); err != nil {
+		t.Fatal(err)
+	}
+	instance := &InstanceContext{DataDir: tmpDir, ListenHost: "127.0.0.1", ListenPort: port, Version: config.Version}
+	if _, err := StartInstance(instance, LaunchOptions{PIDFile: pidFile, RequireSameInstance: true}); err == nil {
+		t.Fatal("foreign process was accepted by start")
+	}
+	if _, err := RestartInstance(instance, LaunchOptions{PIDFile: pidFile, RequireSameInstance: true}); err == nil {
+		t.Fatal("foreign process was accepted by restart")
+	}
+	if !IsPortListening(port) || !IsProcessAlive(os.Getpid()) {
+		t.Fatal("foreign process was stopped or signaled")
+	}
+}
+
 func TestStopDaemon_Scenarios(t *testing.T) {
 	tmpDir := t.TempDir()
 	pidFile := filepath.Join(tmpDir, "stop.pid")

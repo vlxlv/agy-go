@@ -138,8 +138,11 @@ func RestartInstance(ctx *InstanceContext, opts LaunchOptions) (*StartResult, er
 		pidFile = ctx.PIDFile()
 	}
 
-	status, _, msg := CheckStatusWithFile(ctx, pidFile)
-	if status == StatusForeignInstance || status == StatusPortOccupiedForeign {
+	status, info, msg := CheckStatusWithFile(ctx, pidFile)
+	if opts.RequireSameInstance && status == StatusRunningSameInstance {
+		return &StartResult{PID: info.PID, AlreadyRun: true}, nil
+	}
+	if status == StatusForeignInstance || status == StatusPortOccupiedForeign || (opts.RequireSameInstance && status != StatusOutdatedBinary && status != StatusStopped && status != StatusStalePID) {
 		return nil, fmt.Errorf("cannot restart instance: %s", msg)
 	}
 

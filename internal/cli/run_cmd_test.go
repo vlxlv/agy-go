@@ -10,10 +10,177 @@ import (
 	"time"
 
 	"github.com/vlxlv/agy-go/internal/config"
+	"github.com/vlxlv/agy-go/internal/daemon"
 	"github.com/vlxlv/agy-go/internal/diagnostics"
 	"github.com/vlxlv/agy-go/internal/storage"
 	_ "modernc.org/sqlite"
 )
+
+type runCallCounts struct {
+	starts, restarts, syncs, execs         int
+	startRequiresSame, restartRequiresSame bool
+}
+
+func setRunHooks(t *testing.T, status daemon.InstanceStatus, info *daemon.DaemonInfo) *runCallCounts {
+	t.Helper()
+	oldCheck, oldStart, oldRestart, oldSync, oldExec := checkRunInstanceStatus, startRunInstance, restartDaemonInstance, syncRunToken, ExecHandler
+	t.Cleanup(func() {
+		checkRunInstanceStatus, startRunInstance, restartDaemonInstance, syncRunToken, ExecHandler = oldCheck, oldStart, oldRestart, oldSync, oldExec
+	})
+	calls := &runCallCounts{}
+	checkRunInstanceStatus = func(*daemon.InstanceContext) (daemon.InstanceStatus, *daemon.DaemonInfo, string) {
+		return status, info, "synthetic status"
+	}
+	startRunInstance = func(_ *daemon.InstanceContext, opts daemon.LaunchOptions) (*daemon.StartResult, error) {
+		calls.starts++
+		calls.startRequiresSame = opts.RequireSameInstance
+		return &daemon.StartResult{PID: 1234}, nil
+	}
+	restartDaemonInstance = func(_ *daemon.InstanceContext, opts daemon.LaunchOptions) (*daemon.StartResult, error) {
+		calls.restarts++
+		calls.restartRequiresSame = opts.RequireSameInstance
+		return &daemon.StartResult{PID: 1234}, nil
+	}
+	syncRunToken = func() (bool, error) {
+		calls.syncs++
+		return true, nil
+	}
+	ExecHandler = func(string, []string, []string) error {
+		calls.execs++
+		return nil
+	}
+	return calls
+}
+
+func TestRunAgyWithLB_DaemonLifecyclePolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     daemon.InstanceStatus
+		wantStarts int
+	}{
+		{"running", daemon.StatusRunningSameInstance, 0},
+		{"stopped", daemon.StatusStopped, 1},
+		{"stale_pid", daemon.StatusStalePID, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupCLITestEnv(t)
+			diagnostics.SetAgyBinaryFinder(func() string { return "/synthetic/agy" })
+			calls := setRunHooks(t, tc.status, nil)
+			var stdout, stderr bytes.Buffer
+			if code := RunAgyWithLB(nil, &stdout, &stderr); code != 0 {
+				t.Fatalf("code=%d stderr=%s", code, stderr.String())
+			}
+			if calls.starts != tc.wantStarts || calls.restarts != 0 || calls.syncs != 1 || calls.execs != 1 {
+				t.Fatalf("calls=%+v", calls)
+			}
+		})
+	}
+}
+
+func TestRunAgyWithLB_StartRaceWithOutdatedDaemonReloadsSafely(t *testing.T) {
+	setupCLITestEnv(t)
+	diagnostics.SetAgyBinaryFinder(func() string { return "/synthetic/agy" })
+	calls := setRunHooks(t, daemon.StatusStopped, nil)
+	startRunInstance = func(_ *daemon.InstanceContext, opts daemon.LaunchOptions) (*daemon.StartResult, error) {
+		calls.starts++
+		calls.startRequiresSame = opts.RequireSameInstance
+		if !opts.RequireSameInstance {
+			t.Fatal("run start did not require same-instance validation")
+		}
+		return &daemon.StartResult{PID: 1234, WasRestarted: true}, nil
+	}
+	var stdout, stderr bytes.Buffer
+	if code := RunAgyWithLB(nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if calls.starts != 1 || calls.restarts != 0 || calls.syncs != 1 || calls.execs != 1 || !calls.startRequiresSame {
+		t.Fatalf("outdated start race calls=%+v", calls)
+	}
+}
+
+func TestRunAgyWithLB_OutdatedDaemonReloadsAndExecutes(t *testing.T) {
+	setupCLITestEnv(t)
+	diagnostics.SetAgyBinaryFinder(func() string { return "/synthetic/agy" })
+	calls := setRunHooks(t, daemon.StatusOutdatedBinary, &daemon.DaemonInfo{PID: 4242, Version: "old-version"})
+
+	var stdout, stderr bytes.Buffer
+	if code := RunAgyWithLB(nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if calls.starts != 0 || calls.restarts != 1 || calls.syncs != 1 || calls.execs != 1 || !calls.restartRequiresSame {
+		t.Fatalf("outdated run calls=%+v", calls)
+	}
+	if !strings.Contains(stderr.String(), "Outdated daemon detected; reloading") {
+		t.Fatalf("stderr=%s", stderr.String())
+	}
+}
+
+func TestRunAgyWithLB_OutdatedRestartFailureAborts(t *testing.T) {
+	setupCLITestEnv(t)
+	calls := setRunHooks(t, daemon.StatusOutdatedBinary, &daemon.DaemonInfo{PID: 4242})
+	restartDaemonInstance = func(_ *daemon.InstanceContext, opts daemon.LaunchOptions) (*daemon.StartResult, error) {
+		calls.restarts++
+		calls.restartRequiresSame = opts.RequireSameInstance
+		return nil, os.ErrPermission
+	}
+	var stdout, stderr bytes.Buffer
+	if code := RunAgyWithLB(nil, &stdout, &stderr); code != 1 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if calls.restarts != 1 || calls.starts != 0 || calls.syncs != 0 || calls.execs != 0 || !calls.restartRequiresSame {
+		t.Fatalf("failed restart calls=%+v", calls)
+	}
+}
+
+func TestRunAgyWithLB_MismatchAndForeignRemainBlocked(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status daemon.InstanceStatus
+		info   *daemon.DaemonInfo
+	}{
+		{"config_mismatch", daemon.StatusConfigMismatch, &daemon.DaemonInfo{ConfigPath: "/other/config.json"}},
+		{"foreign_instance", daemon.StatusForeignInstance, nil},
+		{"occupied_port", daemon.StatusPortOccupiedForeign, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupCLITestEnv(t)
+			config.SetTestMode(false)
+			calls := setRunHooks(t, tc.status, tc.info)
+			var stdout, stderr bytes.Buffer
+			if code := RunAgyWithLB(nil, &stdout, &stderr); code != 1 {
+				t.Fatalf("code=%d stderr=%s", code, stderr.String())
+			}
+			if calls.starts != 0 || calls.restarts != 0 || calls.syncs != 0 || calls.execs != 0 {
+				t.Fatalf("blocked status continued: %+v", calls)
+			}
+		})
+	}
+}
+
+func TestRunAgyWithLB_ForeignTestModeBehaviorUnchanged(t *testing.T) {
+	setupCLITestEnv(t)
+	diagnostics.SetAgyBinaryFinder(func() string { return "/synthetic/agy" })
+	calls := setRunHooks(t, daemon.StatusForeignInstance, nil)
+	var stdout, stderr bytes.Buffer
+	if code := RunAgyWithLB(nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if calls.starts != 0 || calls.restarts != 0 || calls.syncs != 1 || calls.execs != 1 {
+		t.Fatalf("test-mode behavior changed: %+v", calls)
+	}
+}
+
+func TestRestartDaemonCmd_ExplicitRestartRemainsAvailable(t *testing.T) {
+	setupCLITestEnv(t)
+	calls := setRunHooks(t, daemon.StatusRunningSameInstance, nil)
+	var stdout, stderr bytes.Buffer
+	if code := RestartDaemonCmd(&stdout, &stderr); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if calls.restarts != 1 || calls.starts != 0 || calls.syncs != 0 || calls.execs != 0 || calls.restartRequiresSame {
+		t.Fatalf("explicit restart calls=%+v", calls)
+	}
+}
 
 func TestRunWrapperAndAgyDirect(t *testing.T) {
 	_, cleanup := setupCLITestEnv(t)

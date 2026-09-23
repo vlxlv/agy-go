@@ -28,7 +28,9 @@ type LaunchOptions struct {
 	LogFile        string
 	EntrypointPath string
 	Foreground     bool
-	CustomArgs     []string
+	// RequireSameInstance makes automatic callers reject any existing daemon not owned by ctx.
+	RequireSameInstance bool
+	CustomArgs          []string
 }
 
 // StartResult represents the outcome of a daemon start attempt.
@@ -78,6 +80,17 @@ func StartInstance(ctx *InstanceContext, opts LaunchOptions) (*StartResult, erro
 	// 1. Check current instance status
 	wasRestarted := false
 	if IsDaemonRunning(pidFile, ctx.ListenPort) {
+		if opts.RequireSameInstance {
+			status, info, msg := CheckStatusWithFile(ctx, pidFile)
+			switch status {
+			case StatusRunningSameInstance:
+				return &StartResult{PID: info.PID, AlreadyRun: true}, nil
+			case StatusOutdatedBinary:
+				// Same managed instance; reload below.
+			default:
+				return nil, fmt.Errorf("cannot auto-start instance: %s", msg)
+			}
+		}
 		if IsDaemonOutdated(pidFile, ctx.ListenPort) {
 			wasRestarted = true
 			if err := stopWithFile(ctx, pidFile, 5*time.Second); err != nil {

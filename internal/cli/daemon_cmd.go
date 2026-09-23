@@ -15,6 +15,8 @@ import (
 	"github.com/vlxlv/agy-go/internal/daemon"
 )
 
+var restartDaemonInstance = daemon.RestartInstance
+
 func handleLogs(args []string, stdout, stderr io.Writer) int {
 	lines := 20
 	follow := false
@@ -196,7 +198,7 @@ func RestartDaemonCmd(stdout, stderr io.Writer, args ...string) int {
 		fmt.Fprintf(stderr, "%s[Error] Failed to resolve instance: %v%s\n", clrRed, err, clrReset)
 		return 1
 	}
-	res, err := daemon.RestartInstance(ctx, daemon.LaunchOptions{})
+	res, err := restartDaemonInstance(ctx, daemon.LaunchOptions{})
 	if err != nil {
 		fmt.Fprintf(stderr, "%s[Error] Failed to restart gateway: %v%s\n", clrRed, err, clrReset)
 		return 1

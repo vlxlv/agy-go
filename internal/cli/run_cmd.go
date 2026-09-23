@@ -13,6 +13,12 @@ import (
 	"github.com/vlxlv/agy-go/internal/diagnostics"
 )
 
+var (
+	checkRunInstanceStatus = daemon.CheckInstanceStatus
+	startRunInstance       = daemon.StartInstance
+	syncRunToken           = accounts.SyncActiveAgyTokenFile
+)
+
 // ParseRunArgs parses options scoped to `agy-pool run`.
 // Only parses options before "--".
 // After "--", native agy arguments are preserved byte-for-byte without parsing or modification.
@@ -111,14 +117,13 @@ func RunAgyWithLB(extraArgs []string, stdout, stderr io.Writer) int {
 	}
 
 	// 3. Ensure exact daemon is running for this instance
-	status, info, msg := daemon.CheckInstanceStatus(ctx)
+	status, info, msg := checkRunInstanceStatus(ctx)
 	switch status {
 	case daemon.StatusRunningSameInstance:
 		// Exact instance is running
 	case daemon.StatusOutdatedBinary:
 		fmt.Fprintf(stderr, "%s[agy-pool] Outdated daemon detected; reloading...%s\n", clrYellow, clrReset)
-		_, err := daemon.RestartInstance(ctx, daemon.LaunchOptions{})
-		if err != nil {
+		if _, err := restartDaemonInstance(ctx, daemon.LaunchOptions{RequireSameInstance: true}); err != nil {
 			fmt.Fprintf(stderr, "%s[Error] Failed to reload daemon: %v%s\n", clrRed, err, clrReset)
 			return 1
 		}
@@ -134,7 +139,7 @@ func RunAgyWithLB(extraArgs []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 	case daemon.StatusStopped, daemon.StatusStalePID:
-		_, err := daemon.StartInstance(ctx, daemon.LaunchOptions{})
+		_, err := startRunInstance(ctx, daemon.LaunchOptions{RequireSameInstance: true})
 		if err != nil && !config.IsTestMode() {
 			fmt.Fprintf(stderr, "%s[Error] Failed to start gateway daemon: %v%s\n", clrRed, err, clrReset)
 			return 1
@@ -147,7 +152,7 @@ func RunAgyWithLB(extraArgs []string, stdout, stderr io.Writer) int {
 	env = append(env, "CLOUD_CODE_URL="+gatewayURL)
 
 	// 5. Sync active agy token; pooled execution requires CLI Base identity.
-	if synced, err := accounts.SyncActiveAgyTokenFile(); err != nil || !synced {
+	if synced, err := syncRunToken(); err != nil || !synced {
 		if err == nil {
 			err = fmt.Errorf("no active account was synchronized")
 		}
