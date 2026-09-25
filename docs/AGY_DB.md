@@ -14,7 +14,7 @@ inspection, lifecycle evidence reporting, retention analysis, storage auditing
 and external archival. Source handling remains read-only.
 CP1 provides read-only inventory; CP2 adds a pure retention decision engine and
 dry-run reporting. V2-CP1 adds creation of a detached, verified archive;
-V2-CP2 adds offline verification and an agy-db-owned registry. There is no
+V2-CP2 adds offline verification and an agy-db-owned registry.
 V2-CP3 adds non-overwriting whole-bundle restore. There is no deletion, ledger
 write, conversation editing, database repair or background process.
 The current target is Linux, including Debian WSL; run it inside WSL.

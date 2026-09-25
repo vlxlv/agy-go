@@ -17,8 +17,8 @@ import (
 )
 
 type runCallCounts struct {
-	starts, restarts, syncs, execs         int
-	startRequiresSame, restartRequiresSame bool
+	starts, restarts, syncs, execs                         int
+	startRequiresSame, startNoRestart, restartRequiresSame bool
 }
 
 func setRunHooks(t *testing.T, status daemon.InstanceStatus, info *daemon.DaemonInfo) *runCallCounts {
@@ -34,6 +34,7 @@ func setRunHooks(t *testing.T, status daemon.InstanceStatus, info *daemon.Daemon
 	startRunInstance = func(_ *daemon.InstanceContext, opts daemon.LaunchOptions) (*daemon.StartResult, error) {
 		calls.starts++
 		calls.startRequiresSame = opts.RequireSameInstance
+		calls.startNoRestart = opts.NoRestart
 		return &daemon.StartResult{PID: 1234}, nil
 	}
 	restartDaemonInstance = func(_ *daemon.InstanceContext, opts daemon.LaunchOptions) (*daemon.StartResult, error) {
@@ -73,62 +74,50 @@ func TestRunAgyWithLB_DaemonLifecyclePolicy(t *testing.T) {
 			if calls.starts != tc.wantStarts || calls.restarts != 0 || calls.syncs != 1 || calls.execs != 1 {
 				t.Fatalf("calls=%+v", calls)
 			}
+			if tc.wantStarts == 1 && (!calls.startRequiresSame || !calls.startNoRestart) {
+				t.Fatalf("unsafe start options: %+v", calls)
+			}
 		})
 	}
 }
 
-func TestRunAgyWithLB_StartRaceWithOutdatedDaemonReloadsSafely(t *testing.T) {
+func TestRunAgyWithLB_StartRaceWithOutdatedDaemonFailsClosed(t *testing.T) {
 	setupCLITestEnv(t)
-	diagnostics.SetAgyBinaryFinder(func() string { return "/synthetic/agy" })
 	calls := setRunHooks(t, daemon.StatusStopped, nil)
 	startRunInstance = func(_ *daemon.InstanceContext, opts daemon.LaunchOptions) (*daemon.StartResult, error) {
 		calls.starts++
 		calls.startRequiresSame = opts.RequireSameInstance
-		if !opts.RequireSameInstance {
-			t.Fatal("run start did not require same-instance validation")
+		calls.startNoRestart = opts.NoRestart
+		if !opts.RequireSameInstance || !opts.NoRestart {
+			t.Fatal("run start did not require same-instance validation without restart")
 		}
-		return &daemon.StartResult{PID: 1234, WasRestarted: true}, nil
-	}
-	var stdout, stderr bytes.Buffer
-	if code := RunAgyWithLB(nil, &stdout, &stderr); code != 0 {
-		t.Fatalf("code=%d stderr=%s", code, stderr.String())
-	}
-	if calls.starts != 1 || calls.restarts != 0 || calls.syncs != 1 || calls.execs != 1 || !calls.startRequiresSame {
-		t.Fatalf("outdated start race calls=%+v", calls)
-	}
-}
-
-func TestRunAgyWithLB_OutdatedDaemonReloadsAndExecutes(t *testing.T) {
-	setupCLITestEnv(t)
-	diagnostics.SetAgyBinaryFinder(func() string { return "/synthetic/agy" })
-	calls := setRunHooks(t, daemon.StatusOutdatedBinary, &daemon.DaemonInfo{PID: 4242, Version: "old-version"})
-
-	var stdout, stderr bytes.Buffer
-	if code := RunAgyWithLB(nil, &stdout, &stderr); code != 0 {
-		t.Fatalf("code=%d stderr=%s", code, stderr.String())
-	}
-	if calls.starts != 0 || calls.restarts != 1 || calls.syncs != 1 || calls.execs != 1 || !calls.restartRequiresSame {
-		t.Fatalf("outdated run calls=%+v", calls)
-	}
-	if !strings.Contains(stderr.String(), "Outdated daemon detected; reloading") {
-		t.Fatalf("stderr=%s", stderr.String())
-	}
-}
-
-func TestRunAgyWithLB_OutdatedRestartFailureAborts(t *testing.T) {
-	setupCLITestEnv(t)
-	calls := setRunHooks(t, daemon.StatusOutdatedBinary, &daemon.DaemonInfo{PID: 4242})
-	restartDaemonInstance = func(_ *daemon.InstanceContext, opts daemon.LaunchOptions) (*daemon.StartResult, error) {
-		calls.restarts++
-		calls.restartRequiresSame = opts.RequireSameInstance
-		return nil, os.ErrPermission
+		return nil, daemon.ErrOutdatedDaemonRunning
 	}
 	var stdout, stderr bytes.Buffer
 	if code := RunAgyWithLB(nil, &stdout, &stderr); code != 1 {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
-	if calls.restarts != 1 || calls.starts != 0 || calls.syncs != 0 || calls.execs != 0 || !calls.restartRequiresSame {
-		t.Fatalf("failed restart calls=%+v", calls)
+	if calls.starts != 1 || calls.restarts != 0 || calls.syncs != 0 || calls.execs != 0 || !calls.startRequiresSame || !calls.startNoRestart {
+		t.Fatalf("outdated start race calls=%+v", calls)
+	}
+	if !strings.Contains(stderr.String(), "independent terminal") {
+		t.Fatalf("stderr=%s", stderr.String())
+	}
+}
+
+func TestRunAgyWithLB_OutdatedDaemonFailsClosed(t *testing.T) {
+	setupCLITestEnv(t)
+	calls := setRunHooks(t, daemon.StatusOutdatedBinary, &daemon.DaemonInfo{PID: 4242, Version: "old-version"})
+
+	var stdout, stderr bytes.Buffer
+	if code := RunAgyWithLB(nil, &stdout, &stderr); code != 1 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if calls.starts != 0 || calls.restarts != 0 || calls.syncs != 0 || calls.execs != 0 {
+		t.Fatalf("outdated run calls=%+v", calls)
+	}
+	if !strings.Contains(stderr.String(), "outdated binary") || !strings.Contains(stderr.String(), "independent terminal") || !strings.Contains(stderr.String(), "Current daemon PID: 4242") {
+		t.Fatalf("stderr=%s", stderr.String())
 	}
 }
 

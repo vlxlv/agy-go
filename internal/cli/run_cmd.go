@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -122,11 +123,8 @@ func RunAgyWithLB(extraArgs []string, stdout, stderr io.Writer) int {
 	case daemon.StatusRunningSameInstance:
 		// Exact instance is running
 	case daemon.StatusOutdatedBinary:
-		fmt.Fprintf(stderr, "%s[agy-pool] Outdated daemon detected; reloading...%s\n", clrYellow, clrReset)
-		if _, err := restartDaemonInstance(ctx, daemon.LaunchOptions{RequireSameInstance: true}); err != nil {
-			fmt.Fprintf(stderr, "%s[Error] Failed to reload daemon: %v%s\n", clrRed, err, clrReset)
-			return 1
-		}
+		printOutdatedDaemonError(stderr, info, ctx.Version)
+		return 1
 	case daemon.StatusConfigMismatch:
 		fmt.Fprintf(stderr, "%s[agy-pool] Notice: %s%s\n", clrYellow, msg, clrReset)
 		if info != nil && info.ConfigPath != ctx.ConfigPath {
@@ -139,7 +137,11 @@ func RunAgyWithLB(extraArgs []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 	case daemon.StatusStopped, daemon.StatusStalePID:
-		_, err := startRunInstance(ctx, daemon.LaunchOptions{RequireSameInstance: true})
+		_, err := startRunInstance(ctx, daemon.LaunchOptions{RequireSameInstance: true, NoRestart: true})
+		if errors.Is(err, daemon.ErrOutdatedDaemonRunning) {
+			printOutdatedDaemonError(stderr, daemon.GetDaemonInfo(ctx.PIDFile()), ctx.Version)
+			return 1
+		}
 		if err != nil && !config.IsTestMode() {
 			fmt.Fprintf(stderr, "%s[Error] Failed to start gateway daemon: %v%s\n", clrRed, err, clrReset)
 			return 1
@@ -178,6 +180,22 @@ func RunAgyWithLB(extraArgs []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func printOutdatedDaemonError(stderr io.Writer, info *daemon.DaemonInfo, cliVersion string) {
+	fmt.Fprintf(stderr, "%s[Error] agy-pool daemon is running an outdated binary.%s\n", clrRed, clrReset)
+	fmt.Fprintln(stderr, "Restart it from an independent terminal, then retry.")
+	if info != nil {
+		if info.PID > 0 {
+			fmt.Fprintf(stderr, "Current daemon PID: %d\n", info.PID)
+		}
+		if info.Version != "" {
+			fmt.Fprintf(stderr, "Running daemon version: %s\n", info.Version)
+		}
+	}
+	if cliVersion != "" {
+		fmt.Fprintf(stderr, "Current CLI version: %s\n", cliVersion)
+	}
 }
 
 // RunAgyDirect resolves native agy execution bypassing the proxy gateway.

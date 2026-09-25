@@ -235,6 +235,51 @@ func TestLifecycle_RequireSameInstanceRejectsForeignProcess(t *testing.T) {
 	}
 }
 
+func TestStartInstance_NoRestartLeavesOutdatedDaemonRunning(t *testing.T) {
+	tmpDir := t.TempDir()
+	resetSandbox := config.SetSyntheticSandboxRoot(tmpDir)
+	t.Cleanup(resetSandbox)
+	pidFile := filepath.Join(tmpDir, "agy-pool.pid")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan struct{})
+	portCh := make(chan int, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = RunForeground(ctx, ServerOptions{Port: 0, EphemeralPort: true, PIDFile: pidFile, ReadyChan: ready, BoundPortChan: portCh, DisableSignals: true})
+	}()
+	<-ready
+	port := <-portCh
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	instance := &InstanceContext{DataDir: tmpDir, ListenHost: "127.0.0.1", ListenPort: port, Version: config.Version}
+	if err := WritePIDFile(pidFile, DaemonInfo{PID: os.Getpid(), DataDir: tmpDir, Port: port, Version: "old-version"}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := StartInstance(instance, LaunchOptions{PIDFile: pidFile, RequireSameInstance: true, NoRestart: true}); !errors.Is(err, ErrOutdatedDaemonRunning) {
+		t.Fatalf("expected ErrOutdatedDaemonRunning, got %v", err)
+	}
+	after, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("PID file changed")
+	}
+	if !IsPortListening(port) || !IsProcessAlive(os.Getpid()) {
+		t.Fatal("outdated daemon was stopped or signaled")
+	}
+}
+
 func TestStopDaemon_Scenarios(t *testing.T) {
 	tmpDir := t.TempDir()
 	pidFile := filepath.Join(tmpDir, "stop.pid")

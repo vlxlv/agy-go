@@ -30,7 +30,7 @@ A high-performance, zero-CGO Go implementation and reverse proxy gateway for **A
 ## Building & Installation
 
 ### Requirements
-- Go 1.22+ (tested with Go 1.26.7)
+- Go 1.27 (CI and release builds use the version declared in `go.mod`)
 - Standard POSIX environment (Linux, Termux, macOS)
 
 ### Build from Source
@@ -191,7 +191,7 @@ PYTHON_REFERENCE=/path/to/agy-pool ./scripts/dual-test.sh
 - Login accepts ID tokens only from Google's authenticated HTTPS token endpoint and validates issuer, audience, expiry, subject, and verified email before updating accounts. TLS authenticates this direct token response as permitted by [OIDC Core 3.1.3.7](https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation); local imported JWT claims remain unverified metadata, not proof of identity.
 - Interactive input is canceled and joined when `top` or login exits. The caller's stdin file remains open. Embedded callers must supply a file or in-memory reader, and custom login prompts must honor their context.
 - SQLite and the native token file are separate stores. Account changes use a shared lock and attempt rollback on reported errors, but do not provide crash atomicity across both stores. Managed `agy-pool run` synchronizes from SQLite before execution; `raw` intentionally bypasses synchronization.
-- `agy-pool run` auto-starts a stopped daemon and reloads the same managed daemon when its agy-pool binary is outdated. Foreign or mismatched daemons are never restarted automatically. Deployment agents must not explicitly stop or restart a production daemon from a session that depends on it.
+- `agy-pool run` may auto-start a stopped daemon, but it does not implicitly restart an already-running outdated daemon. Restart an outdated daemon explicitly with `agy-pool restart` from an independent terminal, then retry. Foreign or mismatched daemons are never restarted automatically.
 - Daemon `StatusOutdatedBinary` compares the agy-pool CLI and daemon binaries; it does not describe the native AGY version. Native AGY upgrades are preserved through the managed shim repair flow and do not require a daemon restart because the proxy daemon does not load the native AGY executable.
 - Streaming preserves upstream bytes and detects transport truncation. A clean HTTP EOF alone does not prove a model finished generating; protocol-specific business completion is not inferred, and a committed stream is never replayed.
 

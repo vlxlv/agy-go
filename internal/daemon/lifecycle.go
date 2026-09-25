@@ -19,6 +19,8 @@ const (
 	EnvDaemonPort  = "AGY_POOL_DAEMON_PORT"
 )
 
+var ErrOutdatedDaemonRunning = errors.New("outdated daemon is already running")
+
 // LaunchOptions configures starting the background proxy daemon.
 type LaunchOptions struct {
 	Port           int
@@ -30,7 +32,9 @@ type LaunchOptions struct {
 	Foreground     bool
 	// RequireSameInstance makes automatic callers reject any existing daemon not owned by ctx.
 	RequireSameInstance bool
-	CustomArgs          []string
+	// NoRestart allows starting an absent daemon but never replacing a running outdated daemon.
+	NoRestart  bool
+	CustomArgs []string
 }
 
 // StartResult represents the outcome of a daemon start attempt.
@@ -86,12 +90,18 @@ func StartInstance(ctx *InstanceContext, opts LaunchOptions) (*StartResult, erro
 			case StatusRunningSameInstance:
 				return &StartResult{PID: info.PID, AlreadyRun: true}, nil
 			case StatusOutdatedBinary:
+				if opts.NoRestart {
+					return nil, ErrOutdatedDaemonRunning
+				}
 				// Same managed instance; reload below.
 			default:
 				return nil, fmt.Errorf("cannot auto-start instance: %s", msg)
 			}
 		}
 		if IsDaemonOutdated(pidFile, ctx.ListenPort) {
+			if opts.NoRestart {
+				return nil, ErrOutdatedDaemonRunning
+			}
 			wasRestarted = true
 			if err := stopWithFile(ctx, pidFile, 5*time.Second); err != nil {
 				return nil, fmt.Errorf("failed to stop outdated daemon: %w", err)
